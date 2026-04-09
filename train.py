@@ -181,6 +181,7 @@ def main() -> None:
     encoder_params = count_parameters(encoder)
     predictor_params = count_parameters(predictor)
     print(f"run dir: {run_dir}")
+    print(f"device: {device}")
     print(f"encoder params: {encoder_params:,}")
     print(f"predictor params: {predictor_params:,}")
     print(f"amp: {use_amp}")
