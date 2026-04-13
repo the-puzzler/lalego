@@ -5,7 +5,6 @@ import tarfile
 import urllib.request
 from pathlib import Path
 
-import zstandard as zstd
 from tqdm.auto import tqdm
 
 
@@ -57,26 +56,6 @@ def download(url: str, destination: Path, force: bool) -> None:
                 f.write(chunk)
                 progress.update(len(chunk))
 
-
-def decompress_zst(archive_path: Path, output_path: Path, force: bool) -> None:
-    if output_path.exists() and not force:
-        print(f"Dataset already exists: {output_path}")
-        return
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    dctx = zstd.ZstdDecompressor()
-    with archive_path.open("rb") as src, output_path.open("wb") as dst:
-        with dctx.stream_reader(src) as reader, tqdm(
-            unit="B",
-            unit_scale=True,
-            desc=f"extract {output_path.name}",
-        ) as progress:
-            while True:
-                chunk = reader.read(1024 * 1024)
-                if not chunk:
-                    break
-                dst.write(chunk)
-                progress.update(len(chunk))
 
 def extract_tar_gz(archive_path: Path, output_dir: Path, force: bool) -> None:
     if output_dir.exists() and any(output_dir.iterdir()) and not force:
