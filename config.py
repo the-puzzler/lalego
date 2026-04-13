@@ -2,13 +2,15 @@
 runs_dir = "runs"
 
 # Dataset
-dataset_root = "data/epic_kitchens_100_clips_full"
-data_files = ["clips/**/*.mp4"]
+dataset_root = "data/stablewm/mariodata"
+data_files = ["**/*.png"]
+dataset_fps = 30.0
+max_windows_per_sequence = None
 
 # Temporal sampling
 skip_n = 4
 frames_per_window = 32
-window_stride = 128 #(frames per window * skip n for non overlapping)
+window_stride = 128  # frames_per_window * skip_n for non-overlapping windows
 
 # Image preprocessing
 image_size = 224

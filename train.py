@@ -17,7 +17,7 @@ from tqdm import tqdm
 
 import config as cfg
 from module.dataset import (
-    EpicKitchensWindowDataset,
+    MarioWindowDataset,
     collate_video_windows,
 )
 from module.models import ARPredictor, InverseDynamicsTransformer, VectorQuantizer, ViTFrameEncoder
@@ -148,13 +148,15 @@ def main() -> None:
     metrics_path = run_dir / "metrics.tsv"
     checkpoint_path = run_dir / "latest.pt"
 
-    dataset = EpicKitchensWindowDataset(
+    dataset = MarioWindowDataset(
         data_root=cfg.dataset_root,
         data_files=cfg.data_files,
         frames_per_window=cfg.frames_per_window,
         window_stride=cfg.window_stride,
         skip_n=cfg.skip_n,
         image_size=cfg.image_size,
+        fps=cfg.dataset_fps,
+        max_windows_per_sequence=cfg.max_windows_per_sequence,
     )
 
     loader = DataLoader(
