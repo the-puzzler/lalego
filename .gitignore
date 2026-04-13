@@ -10,3 +10,7 @@ wheels/
 .venv
 
 runs/
+cache
+_tools/
+data/
+tmp_factory032_inspect/

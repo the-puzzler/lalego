@@ -2,37 +2,21 @@ from __future__ import annotations
 
 import io
 import json
+import tarfile
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Iterable, Iterator
+from pathlib import Path
+from typing import Any, Iterator
 
 import av
 import torch
 import torch.nn.functional as F
-from datasets import Features, Value, load_dataset
-from huggingface_hub import hf_hub_download
-from torch.utils.data import IterableDataset
+from torch.utils.data import IterableDataset, get_worker_info
 
 
 EGOCENTRIC_10K_REPO = "builddotai/Egocentric-10K"
-EGOCENTRIC_10K_FEATURES = Features(
-    {
-        "mp4": Value("binary"),
-        "json": {
-            "factory_id": Value("string"),
-            "worker_id": Value("string"),
-            "video_index": Value("int64"),
-            "duration_sec": Value("float64"),
-            "width": Value("int64"),
-            "height": Value("int64"),
-            "fps": Value("float64"),
-            "size_bytes": Value("int64"),
-            "codec": Value("string"),
-        },
-        "__key__": Value("string"),
-        "__url__": Value("string"),
-    }
-)
+VIT_IMAGE_MEAN = torch.tensor([0.5, 0.5, 0.5], dtype=torch.float32).view(1, 3, 1, 1)
+VIT_IMAGE_STD = torch.tensor([0.5, 0.5, 0.5], dtype=torch.float32).view(1, 3, 1, 1)
 
 
 @dataclass(frozen=True)
@@ -61,7 +45,7 @@ def make_raw_window_spec(
         raise ValueError("skip_n must be positive")
 
     raw_frames_per_window = 1 + (frames_per_window - 1) * skip_n
-    raw_stride = window_stride * skip_n
+    raw_stride = window_stride
     raw_min_frames = (
         1 + (min_frames - 1) * skip_n if min_frames is not None else raw_frames_per_window
     )
@@ -72,57 +56,57 @@ def make_raw_window_spec(
     )
 
 
-def load_egocentric10k_stream(
+def resolve_local_data_files(
     *,
-    data_files: list[str] | None = None,
-    token: str | None = None,
-):
-    """Return the streaming train split for Egocentric-10K."""
-    dataset = load_dataset(
-        EGOCENTRIC_10K_REPO,
-        split="train",
-        streaming=True,
-        data_files=data_files,
-        features=EGOCENTRIC_10K_FEATURES,
-        token=token,
-    )
-    return dataset
+    data_root: str | Path,
+    data_files: list[str] | None,
+) -> list[str]:
+    root = Path(data_root).expanduser()
+    patterns = data_files or ["**/*.tar"]
+    matched: list[Path] = []
+
+    for pattern in patterns:
+        matched.extend(path for path in root.glob(pattern) if path.is_file())
+
+    unique_paths = sorted({path.resolve() for path in matched})
+    if not unique_paths:
+        raise ValueError(f"no local tar files matched data_root={root} data_files={patterns}")
+    return [str(path) for path in unique_paths]
 
 
-def load_worker_intrinsics(
-    *,
-    factory_id: str,
-    worker_id: str,
-    token: str | None = None,
-) -> dict[str, Any]:
-    """Download and parse the camera intrinsics for one worker."""
-    path = hf_hub_download(
-        repo_id=EGOCENTRIC_10K_REPO,
-        repo_type="dataset",
-        filename=f"{factory_id}/workers/{worker_id}/intrinsics.json",
-        token=token,
-    )
-    with open(path, "r", encoding="utf-8") as handle:
-        return json.load(handle)
+def iter_local_tar_samples(*, shard_paths: list[str]) -> Iterator[dict[str, Any]]:
+    for shard_path in shard_paths:
+        pending: dict[str, dict[str, Any]] = {}
+        with tarfile.open(shard_path, mode="r") as archive:
+            for member in archive:
+                if not member.isfile():
+                    continue
 
+                member_path = Path(member.name)
+                suffix = member_path.suffix
+                if suffix not in {".mp4", ".json"}:
+                    continue
 
-def decode_video_bytes(video_bytes: bytes) -> tuple[torch.Tensor, float]:
-    """
-    Decode an MP4 payload into a tensor of shape (T, C, H, W) in uint8.
-    Returns frames and the average decoded fps when available.
-    """
-    with av.open(io.BytesIO(video_bytes), mode="r", format="mp4") as container:
-        stream = container.streams.video[0]
-        average_rate = float(stream.average_rate) if stream.average_rate is not None else 0.0
-        frames = []
-        for frame in container.decode(video=0):
-            frame_array = frame.to_ndarray(format="rgb24")
-            frames.append(torch.from_numpy(frame_array).permute(2, 0, 1))
+                file_obj = archive.extractfile(member)
+                if file_obj is None:
+                    continue
 
-    if not frames:
-        raise ValueError("decoded video contains no frames")
+                key = member_path.stem
+                entry = pending.setdefault(
+                    key,
+                    {
+                        "__key__": key,
+                        "__url__": shard_path,
+                    },
+                )
+                payload = file_obj.read()
+                if suffix == ".mp4":
+                    entry["mp4"] = payload
+                else:
+                    entry["json"] = json.loads(payload.decode("utf-8"))
 
-    return torch.stack(frames, dim=0), average_rate
+                if "mp4" in entry and "json" in entry:
+                    yield pending.pop(key)
 
 
 def iter_video_windows_from_bytes(
@@ -132,11 +116,12 @@ def iter_video_windows_from_bytes(
     max_windows: int | None = None,
     max_decode_frames: int | None = None,
 ) -> Iterator[tuple[torch.Tensor, torch.Tensor, float]]:
-    """
-    Decode video bytes lazily and yield consecutive windows without loading the whole clip.
-    """
     with av.open(io.BytesIO(video_bytes), mode="r", format="mp4") as container:
         stream = container.streams.video[0]
+        try:
+            stream.thread_type = "AUTO"
+        except Exception:
+            pass
         average_rate = float(stream.average_rate) if stream.average_rate is not None else 0.0
         frame_buffer: deque[torch.Tensor] = deque(maxlen=spec.frames_per_window)
         index_buffer: deque[int] = deque(maxlen=spec.frames_per_window)
@@ -146,16 +131,14 @@ def iter_video_windows_from_bytes(
             if max_decode_frames is not None and frame_index >= max_decode_frames:
                 break
 
-            frame_array = frame.to_ndarray(format="rgb24")
-            frame_tensor = torch.from_numpy(frame_array).permute(2, 0, 1)
+            frame_tensor = torch.from_numpy(frame.to_ndarray(format="rgb24")).permute(2, 0, 1)
             frame_buffer.append(frame_tensor)
             index_buffer.append(frame_index)
 
             if len(frame_buffer) < spec.frames_per_window:
                 continue
 
-            start_index = index_buffer[0]
-            if start_index % spec.stride != 0:
+            if index_buffer[0] % spec.stride != 0:
                 continue
 
             yield (
@@ -169,33 +152,12 @@ def iter_video_windows_from_bytes(
                 break
 
 
-def iter_consecutive_windows(
-    frames: torch.Tensor,
-    spec: WindowSpec,
-) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
-    """Yield consecutive frame windows and their source indices."""
-    num_frames = frames.shape[0]
-    if num_frames < max(spec.frames_per_window, spec.min_frames):
-        return
-
-    last_start = num_frames - spec.frames_per_window
-    for start in range(0, last_start + 1, spec.stride):
-        end = start + spec.frames_per_window
-        yield frames[start:end], torch.arange(start, end, dtype=torch.long)
-
-
-def tokenize_frame_window(
+def preprocess_frame_window(
     frames: torch.Tensor,
     *,
     skip_n: int = 1,
     image_size: int,
 ) -> torch.Tensor:
-    """
-    Convert a frame window into simple per-frame tokens.
-
-    frames: (T, C, H, W) uint8 or float
-    returns: (T, 3 * image_size * image_size) float32 in [0, 1]
-    """
     if skip_n <= 0:
         raise ValueError("skip_n must be positive")
 
@@ -207,24 +169,14 @@ def tokenize_frame_window(
         mode="bilinear",
         align_corners=False,
     )
-    return frames.reshape(frames.shape[0], -1)
+    return (frames - VIT_IMAGE_MEAN) / VIT_IMAGE_STD
 
 
 class Egocentric10KWindowDataset(IterableDataset):
-    """
-    Stream Egocentric-10K and emit fixed-length consecutive frame windows.
-
-    Each yielded item is a dict with:
-    - frames: (window, C, H, W) uint8 by default
-    - frame_indices: (window,)
-    - fps: decoded fps if available, otherwise metadata fps
-    - metadata: original JSON metadata
-    - key/url: WebDataset identifiers
-    """
-
     def __init__(
         self,
         *,
+        data_root: str | Path,
         data_files: list[str] | None = None,
         frames_per_window: int = 32,
         window_stride: int = 1,
@@ -233,10 +185,11 @@ class Egocentric10KWindowDataset(IterableDataset):
         max_decode_frames: int | None = None,
         skip_n: int = 1,
         image_size: int | None = None,
-        token: str | None = None,
         transform=None,
+        include_frames: bool = True,
     ):
         super().__init__()
+        self.data_root = data_root
         self.data_files = data_files
         self.spec = make_raw_window_spec(
             frames_per_window=frames_per_window,
@@ -248,14 +201,22 @@ class Egocentric10KWindowDataset(IterableDataset):
         self.max_decode_frames = max_decode_frames
         self.skip_n = skip_n
         self.image_size = image_size
-        self.token = token
         self.transform = transform
-
-    def _iter_source(self) -> Iterable[dict[str, Any]]:
-        return load_egocentric10k_stream(data_files=self.data_files, token=self.token)
+        self.include_frames = include_frames
 
     def __iter__(self) -> Iterator[dict[str, Any]]:
-        for sample in self._iter_source():
+        shard_paths = resolve_local_data_files(
+            data_root=self.data_root,
+            data_files=self.data_files,
+        )
+
+        worker_info = get_worker_info()
+        if worker_info is not None:
+            shard_paths = shard_paths[worker_info.id :: worker_info.num_workers]
+        if not shard_paths:
+            return
+
+        for sample in iter_local_tar_samples(shard_paths=shard_paths):
             metadata = sample["json"]
             metadata_fps = float(metadata.get("fps", 0.0))
 
@@ -269,7 +230,6 @@ class Egocentric10KWindowDataset(IterableDataset):
                     window = self.transform(window)
 
                 sample_out = {
-                    "frames": window,
                     "frame_indices": frame_indices,
                     "fps": decoded_fps or metadata_fps,
                     "metadata": metadata,
@@ -277,8 +237,11 @@ class Egocentric10KWindowDataset(IterableDataset):
                     "url": sample["__url__"],
                 }
 
+                if self.include_frames:
+                    sample_out["frames"] = window
+
                 if self.image_size is not None:
-                    sample_out["tokens"] = tokenize_frame_window(
+                    sample_out["pixel_values"] = preprocess_frame_window(
                         window,
                         skip_n=self.skip_n,
                         image_size=self.image_size,
@@ -288,15 +251,15 @@ class Egocentric10KWindowDataset(IterableDataset):
 
 
 def collate_video_windows(batch: list[dict[str, Any]]) -> dict[str, Any]:
-    """Stack frame windows into a training batch."""
     collated = {
-        "frames": torch.stack([item["frames"] for item in batch], dim=0),
         "frame_indices": torch.stack([item["frame_indices"] for item in batch], dim=0),
         "fps": torch.tensor([item["fps"] for item in batch], dtype=torch.float32),
         "metadata": [item["metadata"] for item in batch],
         "key": [item["key"] for item in batch],
         "url": [item["url"] for item in batch],
     }
-    if "tokens" in batch[0]:
-        collated["tokens"] = torch.stack([item["tokens"] for item in batch], dim=0)
+    if "frames" in batch[0]:
+        collated["frames"] = torch.stack([item["frames"] for item in batch], dim=0)
+    if "pixel_values" in batch[0]:
+        collated["pixel_values"] = torch.stack([item["pixel_values"] for item in batch], dim=0)
     return collated

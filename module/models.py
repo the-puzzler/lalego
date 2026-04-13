@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 from torch import nn
+from transformers import ViTConfig, ViTModel
 
 
 def modulate(x, shift, scale):
@@ -244,33 +245,51 @@ class Transformer(nn.Module):
         return self.output_proj(x)
 
 
-class Embedder(nn.Module):
-    """Projects input features into encoder embeddings."""
+class ViTFrameEncoder(nn.Module):
+    """Per-frame Vision Transformer encoder."""
 
     def __init__(
         self,
-        input_dim=10,
-        smoothed_dim=10,
-        emb_dim=10,
-        mlp_scale=4,
+        *,
+        image_size: int = 224,
+        patch_size: int = 14,
+        hidden_dim: int = 192,
+        depth: int = 12,
+        heads: int = 3,
+        mlp_dim: int = 768,
+        output_dim: int | None = None,
+        dropout: float = 0.0,
     ):
         super().__init__()
-        self.patch_embed = nn.Conv1d(input_dim, smoothed_dim, kernel_size=1, stride=1)
-        self.embed = nn.Sequential(
-            nn.Linear(smoothed_dim, mlp_scale * emb_dim),
-            nn.SiLU(),
-            nn.Linear(mlp_scale * emb_dim, emb_dim),
+        config = ViTConfig(
+            image_size=image_size,
+            patch_size=patch_size,
+            hidden_size=hidden_dim,
+            num_hidden_layers=depth,
+            num_attention_heads=heads,
+            intermediate_size=mlp_dim,
+            hidden_dropout_prob=dropout,
+            attention_probs_dropout_prob=dropout,
+            qkv_bias=True,
+        )
+        self.backbone = ViTModel(config, add_pooling_layer=False)
+        self.output_proj = (
+            nn.Linear(hidden_dim, output_dim)
+            if output_dim is not None and output_dim != hidden_dim
+            else nn.Identity()
         )
 
-    def forward(self, x):
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """
-        x: (B, T, D)
+        pixel_values: (B, T, C, H, W)
+        returns: (B, T, D)
         """
-        x = x.float()
-        x = x.permute(0, 2, 1)
-        x = self.patch_embed(x)
-        x = x.permute(0, 2, 1)
-        return self.embed(x)
+        batch_size, num_frames, channels, height, width = pixel_values.shape
+        flat_pixels = pixel_values.reshape(batch_size * num_frames, channels, height, width)
+        outputs = self.backbone(pixel_values=flat_pixels)
+        cls_tokens = outputs.last_hidden_state[:, 0]
+        cls_tokens = self.output_proj(cls_tokens)
+        return cls_tokens.reshape(batch_size, num_frames, -1)
 
 
 class InverseDynamicsTransformer(nn.Module):

@@ -17,7 +17,7 @@ from tqdm import tqdm
 
 import config as cfg
 from module.dataset import Egocentric10KWindowDataset, collate_video_windows
-from module.models import ARPredictor, Transformer
+from module.models import ARPredictor, InverseDynamicsTransformer, VectorQuantizer, ViTFrameEncoder
 from module.sigreg import SIGReg
 
 matplotlib.use("Agg")
@@ -62,7 +62,9 @@ def append_metrics_rows(metrics_path: Path, rows: list[dict[str, float]], start_
     with metrics_path.open("a", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle, delimiter="\t")
         if not file_exists:
-            writer.writerow(["step", "loss", "mse", "sigreg", "lr"])
+            writer.writerow(
+                ["step", "loss", "mse", "sigreg", "codebook", "commitment", "lr"]
+            )
         for row in rows[start_index:]:
             writer.writerow(
                 [
@@ -70,6 +72,8 @@ def append_metrics_rows(metrics_path: Path, rows: list[dict[str, float]], start_
                     f"{row['loss']:.8f}",
                     f"{row['mse']:.8f}",
                     f"{row['sigreg']:.8f}",
+                    f"{row['codebook']:.8f}",
+                    f"{row['commitment']:.8f}",
                     f"{row['lr']:.10f}",
                 ]
             )
@@ -81,11 +85,13 @@ def save_metrics_plot(run_dir: Path, rows: list[dict[str, float]]) -> None:
         return
 
     steps = [row["step"] for row in rows]
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    fig, axes = plt.subplots(3, 2, figsize=(12, 12))
     series = [
         ("loss", "Total Loss"),
         ("mse", "MSE Loss"),
         ("sigreg", "SIGReg Loss"),
+        ("codebook", "Codebook Loss"),
+        ("commitment", "Commitment Loss"),
         ("lr", "Learning Rate"),
     ]
 
@@ -105,7 +111,9 @@ def save_latest_checkpoint(
     checkpoint_path: Path,
     *,
     step: int,
-    encoder: nn.Module,
+    frame_encoder: nn.Module,
+    codebook: nn.Module,
+    inverse_dynamics: nn.Module,
     predictor: nn.Module,
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LambdaLR,
@@ -114,7 +122,9 @@ def save_latest_checkpoint(
     torch.save(
         {
             "step": step,
-            "encoder": encoder.state_dict(),
+            "frame_encoder": frame_encoder.state_dict(),
+            "codebook": codebook.state_dict(),
+            "inverse_dynamics": inverse_dynamics.state_dict(),
             "predictor": predictor.state_dict(),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
@@ -135,13 +145,14 @@ def main() -> None:
     metrics_path = run_dir / "metrics.tsv"
     checkpoint_path = run_dir / "latest.pt"
 
-    input_dim = 3 * cfg.image_size * cfg.image_size
     dataset = Egocentric10KWindowDataset(
+        data_root=cfg.dataset_root,
         data_files=cfg.data_files,
         frames_per_window=cfg.frames_per_window,
         window_stride=cfg.window_stride,
         skip_n=cfg.skip_n,
         image_size=cfg.image_size,
+        include_frames=False,
     )
     loader = DataLoader(
         dataset,
@@ -150,13 +161,30 @@ def main() -> None:
         num_workers=cfg.num_workers,
         persistent_workers=cfg.persistent_workers if cfg.num_workers > 0 else False,
         pin_memory=device == "cuda",
+        prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
     )
 
-    encoder = Transformer(
-        input_dim=input_dim,
-        hidden_dim=cfg.encoder_hidden_dim,
+    frame_encoder = ViTFrameEncoder(
+        image_size=cfg.image_size,
+        patch_size=cfg.frame_patch_size,
+        hidden_dim=cfg.frame_hidden_dim,
+        depth=cfg.frame_depth,
+        heads=cfg.frame_heads,
+        mlp_dim=cfg.frame_mlp_dim,
         output_dim=cfg.latent_dim,
-        depth=cfg.encoder_depth,
+        dropout=cfg.dropout,
+    ).to(device)
+    codebook = VectorQuantizer(
+        num_codes=cfg.num_codes,
+        code_dim=cfg.latent_dim,
+        beta=cfg.codebook_beta,
+    ).to(device)
+    inverse_dynamics = InverseDynamicsTransformer(
+        num_frames=cfg.frames_per_window,
+        input_dim=cfg.latent_dim,
+        hidden_dim=cfg.id_hidden_dim,
+        output_dim=cfg.latent_dim,
+        depth=cfg.id_depth,
         heads=cfg.heads,
         dim_head=cfg.dim_head,
         mlp_dim=cfg.mlp_dim,
@@ -175,27 +203,38 @@ def main() -> None:
     ).to(device)
     sigreg = SIGReg().to(device)
     if use_compile:
-        encoder = torch.compile(encoder)
+        frame_encoder = torch.compile(frame_encoder)
+        codebook = torch.compile(codebook)
+        inverse_dynamics = torch.compile(inverse_dynamics)
         predictor = torch.compile(predictor)
 
-    encoder_params = count_parameters(encoder)
+    frame_encoder_params = count_parameters(frame_encoder)
+    codebook_params = count_parameters(codebook)
+    inverse_dynamics_params = count_parameters(inverse_dynamics)
     predictor_params = count_parameters(predictor)
     print(f"run dir: {run_dir}")
     print(f"device: {device}")
-    print(f"encoder params: {encoder_params:,}")
+    print(f"frame encoder params: {frame_encoder_params:,}")
+    print(f"codebook params: {codebook_params:,}")
+    print(f"inverse dynamics params: {inverse_dynamics_params:,}")
     print(f"predictor params: {predictor_params:,}")
     print(f"amp: {use_amp}")
     print(f"compile: {use_compile}")
 
     optimizer = torch.optim.AdamW(
-        list(encoder.parameters()) + list(predictor.parameters()),
+        list(frame_encoder.parameters())
+        + list(codebook.parameters())
+        + list(inverse_dynamics.parameters())
+        + list(predictor.parameters()),
         lr=cfg.lr,
         weight_decay=cfg.weight_decay,
     )
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_multiplier)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
-    encoder.train()
+    frame_encoder.train()
+    codebook.train()
+    inverse_dynamics.train()
     predictor.train()
 
     metrics_history: list[dict[str, float]] = []
@@ -207,7 +246,7 @@ def main() -> None:
             progress.close()
             break
 
-        tokens = batch["tokens"].to(device, non_blocking=True)
+        pixel_values = batch["pixel_values"].to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
 
@@ -215,13 +254,23 @@ def main() -> None:
             torch.autocast(device_type="cuda", dtype=torch.float16) if use_amp else nullcontext()
         )
         with autocast_context:
-            latents = encoder(tokens)
-            predictions = predictor(latents[:, :-1], latents[:, :-1])
+            latents = frame_encoder(pixel_values)
+            action_logits = inverse_dynamics(latents)
+            quantizer_outputs = codebook(action_logits)
+            quantized_actions = quantizer_outputs["quantized"]
+            predictions = predictor(latents[:, :-1], quantized_actions[:, :-1])
             targets = latents[:, 1:]
 
             mse_loss = F.mse_loss(predictions, targets)
             sigreg_loss = sigreg(latents.transpose(0, 1))
-            loss = mse_loss + (cfg.sigreg_weight * sigreg_loss)
+            codebook_loss = quantizer_outputs["codebook_loss"]
+            commitment_loss = quantizer_outputs["commitment_loss"]
+            loss = (
+                mse_loss
+                + (cfg.sigreg_weight * sigreg_loss)
+                + (cfg.codebook_loss_weight * codebook_loss)
+                + (cfg.commitment_loss_weight * commitment_loss)
+            )
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -235,6 +284,8 @@ def main() -> None:
                 "loss": float(loss.item()),
                 "mse": float(mse_loss.item()),
                 "sigreg": float(sigreg_loss.item()),
+                "codebook": float(codebook_loss.item()),
+                "commitment": float(commitment_loss.item()),
                 "lr": float(current_lr),
             }
         )
@@ -243,7 +294,9 @@ def main() -> None:
             save_latest_checkpoint(
                 checkpoint_path,
                 step=step,
-                encoder=encoder,
+                frame_encoder=frame_encoder,
+                codebook=codebook,
+                inverse_dynamics=inverse_dynamics,
                 predictor=predictor,
                 optimizer=optimizer,
                 scheduler=scheduler,
@@ -258,14 +311,18 @@ def main() -> None:
             loss=f"{loss.item():.6f}",
             mse=f"{mse_loss.item():.6f}",
             sigreg=f"{sigreg_loss.item():.6f}",
+            codebook=f"{codebook_loss.item():.6f}",
+            commitment=f"{commitment_loss.item():.6f}",
             lr=f"{current_lr:.2e}",
-            token_shape=str(tuple(tokens.shape)),
+            pixel_shape=str(tuple(pixel_values.shape)),
         )
 
     save_latest_checkpoint(
         checkpoint_path,
         step=min(cfg.max_steps, len(metrics_history)),
-        encoder=encoder,
+        frame_encoder=frame_encoder,
+        codebook=codebook,
+        inverse_dynamics=inverse_dynamics,
         predictor=predictor,
         optimizer=optimizer,
         scheduler=scheduler,
