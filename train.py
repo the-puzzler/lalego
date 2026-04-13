@@ -16,7 +16,10 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 import config as cfg
-from module.dataset import Egocentric10KWindowDataset, collate_video_windows
+from module.dataset import (
+    EpicKitchensWindowDataset,
+    collate_video_windows,
+)
 from module.models import ARPredictor, InverseDynamicsTransformer, VectorQuantizer, ViTFrameEncoder
 from module.sigreg import SIGReg
 
@@ -145,15 +148,15 @@ def main() -> None:
     metrics_path = run_dir / "metrics.tsv"
     checkpoint_path = run_dir / "latest.pt"
 
-    dataset = Egocentric10KWindowDataset(
+    dataset = EpicKitchensWindowDataset(
         data_root=cfg.dataset_root,
         data_files=cfg.data_files,
         frames_per_window=cfg.frames_per_window,
         window_stride=cfg.window_stride,
         skip_n=cfg.skip_n,
         image_size=cfg.image_size,
-        include_frames=False,
     )
+
     loader = DataLoader(
         dataset,
         batch_size=cfg.batch_size,

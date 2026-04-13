@@ -2,8 +2,8 @@
 runs_dir = "runs"
 
 # Dataset
-dataset_root = "data/egocentric10k"
-data_files = ["factory_032/workers/worker_*/*.tar"]
+dataset_root = "data/epic_kitchens_100_clips_full"
+data_files = ["clips/**/*.mp4"]
 
 # Temporal sampling
 skip_n = 4
@@ -15,7 +15,7 @@ image_size = 224
 
 # Optimization
 batch_size = 16
-num_workers = 16
+num_workers = 2
 persistent_workers = True
 prefetch_factor = 4
 max_steps = 100
