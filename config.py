@@ -15,7 +15,7 @@ image_size = 224
 
 # Optimization
 batch_size = 16
-num_workers = 4
+num_workers = 16
 persistent_workers = True
 prefetch_factor = 4
 max_steps = 100

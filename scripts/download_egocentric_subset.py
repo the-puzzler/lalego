@@ -4,6 +4,11 @@ import argparse
 import concurrent.futures
 import fnmatch
 from pathlib import Path
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from huggingface_hub import hf_hub_download, list_repo_files
 
@@ -12,7 +17,7 @@ from module.dataset import EGOCENTRIC_10K_REPO
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Download a local Egocentric-10K subset.")
-    parser.add_argument("--factory", required=True, help="Factory id, e.g. 032")
+    parser.add_argument("--factory", default="032", help="Factory id, e.g. 032")
     parser.add_argument(
         "--workers",
         default="*",
@@ -23,7 +28,12 @@ def parse_args() -> argparse.Namespace:
         default="data/egocentric10k",
         help="Local dataset root.",
     )
-    parser.add_argument("--jobs", type=int, default=4, help="Parallel download workers.")
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=None,
+        help="Parallel download workers. Defaults to all matched tar files.",
+    )
     return parser.parse_args()
 
 
@@ -87,13 +97,14 @@ def main() -> None:
     dest.mkdir(parents=True, exist_ok=True)
 
     repo_files = matching_repo_files(args.factory, args.workers)
+    jobs = args.jobs if args.jobs is not None else max(1, len(repo_files))
     print(f"factory: {int(args.factory):03d}")
     print(f"workers: {args.workers}")
     print(f"dest: {dest}")
     print(f"matched_tar_files: {len(repo_files)}")
-    print(f"parallel_jobs: {args.jobs}")
+    print(f"parallel_jobs: {jobs}")
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as executor:
         futures = {
             executor.submit(download_one, repo_file, dest): repo_file for repo_file in repo_files
         }
