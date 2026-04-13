@@ -137,6 +137,10 @@ def save_latest_checkpoint(
     )
 
 
+def describe_tensor_shape(tensor: torch.Tensor) -> tuple[int, ...]:
+    return tuple(int(dim) for dim in tensor.shape)
+
+
 def main() -> None:
     device = cfg.device
     if device == "cuda" and not torch.cuda.is_available():
@@ -159,6 +163,23 @@ def main() -> None:
         max_windows_per_sequence=cfg.max_windows_per_sequence,
     )
 
+    try:
+        first_sample = next(iter(dataset))
+    except StopIteration as exc:
+        raise RuntimeError(
+            "Mario dataset produced no training windows. "
+            "Check dataset_root/data_files and your temporal sampling settings."
+        ) from exc
+
+    print(
+        "first sample:",
+        {
+            "key": first_sample["key"],
+            "pixel_values": describe_tensor_shape(first_sample["pixel_values"]),
+            "frame_indices": describe_tensor_shape(first_sample["frame_indices"]),
+        },
+    )
+
     loader = DataLoader(
         dataset,
         batch_size=cfg.batch_size,
@@ -167,6 +188,23 @@ def main() -> None:
         persistent_workers=cfg.persistent_workers if cfg.num_workers > 0 else False,
         pin_memory=device == "cuda",
         prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
+    )
+
+    try:
+        first_batch = next(iter(loader))
+    except StopIteration as exc:
+        raise RuntimeError(
+            "DataLoader produced no batches. "
+            "Check batch_size, num_workers, and dataset contents."
+        ) from exc
+
+    print(
+        "first batch:",
+        {
+            "pixel_values": describe_tensor_shape(first_batch["pixel_values"]),
+            "frame_indices": describe_tensor_shape(first_batch["frame_indices"]),
+            "batch_size": len(first_batch["key"]),
+        },
     )
 
     frame_encoder = ViTFrameEncoder(
@@ -245,6 +283,7 @@ def main() -> None:
     metrics_history: list[dict[str, float]] = []
     flushed_metrics = 0
 
+    print("starting training loop")
     progress = tqdm(loader, total=cfg.max_steps, desc="train", dynamic_ncols=True)
     for step, batch in enumerate(progress, start=1):
         if step > cfg.max_steps:
