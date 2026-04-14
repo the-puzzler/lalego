@@ -185,8 +185,8 @@ class Transformer(nn.Module):
         return self.output_proj(x)
 
 
-class EEGPatchEncoder(nn.Module):
-    """Token encoder for EEG patch sequences."""
+class SignalPatchEncoder(nn.Module):
+    """Encode each temporal chunk into a single latent via internal patchification."""
 
     def __init__(
         self,
@@ -198,12 +198,21 @@ class EEGPatchEncoder(nn.Module):
         heads: int,
         mlp_dim: int,
         output_dim: int | None = None,
+        projector_hidden_dim: int | None = None,
         dim_head: int = 64,
         dropout: float = 0.0,
     ):
         super().__init__()
-        input_dim = num_channels * patch_size
-        self.input_proj = nn.Linear(input_dim, hidden_dim)
+        self.patch_size = patch_size
+        conv_hidden_dim = max(hidden_dim // 2, 8)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+        # A small strided conv frontend compresses local waveform structure before the transformer.
+        self.frontend = nn.Sequential(
+            nn.Conv1d(num_channels, conv_hidden_dim, kernel_size=15, stride=5, padding=7),
+            nn.GELU(),
+            nn.Conv1d(conv_hidden_dim, hidden_dim, kernel_size=15, stride=5, padding=7),
+            nn.GELU(),
+        )
         self.transformer = Transformer(
             input_dim=hidden_dim,
             hidden_dim=hidden_dim,
@@ -214,16 +223,32 @@ class EEGPatchEncoder(nn.Module):
             mlp_dim=mlp_dim,
             dropout=dropout,
         )
+        projector_output_dim = output_dim or hidden_dim
+        projector_hidden_dim = projector_hidden_dim or hidden_dim
+        self.projector = nn.Sequential(
+            nn.Linear(projector_output_dim, projector_hidden_dim),
+            nn.BatchNorm1d(projector_hidden_dim),
+            nn.GELU(),
+            nn.Linear(projector_hidden_dim, projector_output_dim),
+        )
 
-    def forward(self, eeg_values: torch.Tensor) -> torch.Tensor:
+    def forward(self, signal_values: torch.Tensor) -> torch.Tensor:
         """
-        eeg_values: (B, T, C, P)
-        returns: (B, T, D)
+        signal_values: (B, T, C, S)
+        returns: (B, T, D), one latent per chunk
         """
-        batch_size, num_tokens, num_channels, patch_size = eeg_values.shape
-        flat_tokens = eeg_values.reshape(batch_size, num_tokens, num_channels * patch_size)
-        projected = self.input_proj(flat_tokens)
-        return self.transformer(projected)
+        batch_size, num_chunks, num_channels, num_samples = signal_values.shape
+        flat_chunks = signal_values.reshape(batch_size * num_chunks, num_channels, num_samples)
+        features = self.frontend(flat_chunks)
+        num_patches = max(1, num_samples // self.patch_size)
+        pooled = F.adaptive_avg_pool1d(features, num_patches)
+        tokens = pooled.transpose(1, 2).contiguous()
+        cls_tokens = self.cls_token.expand(tokens.shape[0], -1, -1)
+        tokens = torch.cat([tokens, cls_tokens], dim=1)
+        encoded = self.transformer(tokens)
+        cls_latents = encoded[:, -1]
+        projected = self.projector(cls_latents)
+        return projected.reshape(batch_size, num_chunks, -1)
 
 
 class InverseDynamicsTransformer(nn.Module):

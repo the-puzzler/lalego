@@ -88,7 +88,7 @@ def save_metrics_plot(run_dir: Path, rows: list[dict[str, float]]) -> None:
         return
 
     steps = [row["step"] for row in rows]
-    fig, axes = plt.subplots(3, 2, figsize=(12, 12))
+    fig, axes = plt.subplots(4, 2, figsize=(12, 16))
     series = [
         ("loss", "Total Loss"),
         ("mse", "MSE Loss"),

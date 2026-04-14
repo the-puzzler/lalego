@@ -12,10 +12,10 @@ from tqdm import tqdm
 
 import config as cfg
 from module.dataset import (
-    EEGTokenDataset,
-    collate_eeg_windows,
+    build_audio_dataset,
+    collate_audio_windows,
 )
-from module.models import ARPredictor, EEGPatchEncoder, InverseDynamicsTransformer, VectorQuantizer
+from module.models import ARPredictor, InverseDynamicsTransformer, SignalPatchEncoder, VectorQuantizer
 from module.sigreg import SIGReg
 from module.utils import (
     append_metrics_rows,
@@ -51,6 +51,8 @@ def compute_action_outputs(
 
     if cfg.action_source == "label":
         label_ids = batch["label_id"].to(device, non_blocking=True)
+        if torch.any(label_ids < 0):
+            raise ValueError("action_source='label' requires dataset labels, but label_id < 0 found")
         quantized_actions = inverse_dynamics(label_ids).unsqueeze(1).expand(
             -1,
             latents.shape[1] - 1,
@@ -95,8 +97,8 @@ def evaluate(
 
     with torch.no_grad():
         for batch in loader:
-            eeg_values = batch["eeg_values"].to(device, non_blocking=True)
-            latents = frame_encoder(eeg_values)
+            signal_values = batch["signal_values"].to(device, non_blocking=True)
+            latents = frame_encoder(signal_values)
             quantized_actions, codebook_loss, commitment_loss = compute_action_outputs(
                 latents=latents,
                 batch=batch,
@@ -144,46 +146,48 @@ def main() -> None:
     metrics_path = run_dir / "metrics.tsv"
     checkpoint_path = run_dir / "latest.pt"
 
-    dataset = EEGTokenDataset(
-        data_root=cfg.dataset_root,
-        data_files=cfg.data_files,
-        sample_rate=cfg.dataset_fps,
-        num_channels=cfg.eeg_num_channels,
-        subject_ids=cfg.train_subject_ids,
-        train_session_suffixes=cfg.train_session_suffixes,
-        patch_size=cfg.eeg_patch_size,
-        bandpass_low_hz=cfg.eeg_bandpass_low_hz,
-        bandpass_high_hz=cfg.eeg_bandpass_high_hz,
-        epoch_start_seconds=cfg.eeg_epoch_start_seconds,
-        epoch_end_seconds=cfg.eeg_epoch_end_seconds,
+    dataset = build_audio_dataset(
+        dataset_backend=cfg.dataset_backend,
+        dataset_root=cfg.dataset_root,
+        dataset_cache_root=cfg.dataset_cache_root,
+        splits=cfg.dataset_train_splits,
+        sample_rate=cfg.audio_sample_rate,
+        patch_size=cfg.audio_patch_samples,
+        clip_seconds=cfg.audio_clip_seconds,
+        clip_stride_seconds=cfg.audio_clip_stride_seconds,
+        sequence_length=cfg.audio_sequence_length,
+        sequence_stride=cfg.audio_sequence_stride,
+        mono=cfg.audio_mono,
+        normalization=cfg.audio_normalization,
     )
-    val_dataset = EEGTokenDataset(
-        data_root=cfg.dataset_root,
-        data_files=cfg.data_files,
-        sample_rate=cfg.dataset_fps,
-        num_channels=cfg.eeg_num_channels,
-        subject_ids=cfg.val_subject_ids,
-        train_session_suffixes=cfg.train_session_suffixes,
-        patch_size=cfg.eeg_patch_size,
-        bandpass_low_hz=cfg.eeg_bandpass_low_hz,
-        bandpass_high_hz=cfg.eeg_bandpass_high_hz,
-        epoch_start_seconds=cfg.eeg_epoch_start_seconds,
-        epoch_end_seconds=cfg.eeg_epoch_end_seconds,
+    val_dataset = build_audio_dataset(
+        dataset_backend=cfg.dataset_backend,
+        dataset_root=cfg.dataset_root,
+        dataset_cache_root=cfg.dataset_cache_root,
+        splits=cfg.dataset_val_splits,
+        sample_rate=cfg.audio_sample_rate,
+        patch_size=cfg.audio_patch_samples,
+        clip_seconds=cfg.audio_clip_seconds,
+        clip_stride_seconds=cfg.audio_clip_stride_seconds,
+        sequence_length=cfg.audio_sequence_length,
+        sequence_stride=cfg.audio_sequence_stride,
+        mono=cfg.audio_mono,
+        normalization=cfg.audio_normalization,
     )
 
     try:
         first_sample = next(iter(dataset))
     except StopIteration as exc:
         raise RuntimeError(
-            "EEG dataset produced no training trials. "
-            "Check dataset_root/data_files and your temporal sampling settings."
+            "Audio dataset produced no training clips. "
+            "Check dataset_root, MAESTRO extraction, and your clip settings."
         ) from exc
 
     print(
         "first sample:",
         {
             "key": first_sample["key"],
-            "eeg_values": describe_tensor_shape(first_sample["eeg_values"]),
+            "signal_values": describe_tensor_shape(first_sample["signal_values"]),
             "frame_indices": describe_tensor_shape(first_sample["frame_indices"]),
         },
     )
@@ -191,7 +195,7 @@ def main() -> None:
     loader = DataLoader(
         dataset,
         batch_size=cfg.batch_size,
-        collate_fn=collate_eeg_windows,
+        collate_fn=collate_audio_windows,
         num_workers=cfg.num_workers,
         persistent_workers=cfg.persistent_workers if cfg.num_workers > 0 else False,
         pin_memory=device == "cuda",
@@ -200,7 +204,7 @@ def main() -> None:
     val_loader = DataLoader(
         val_dataset,
         batch_size=cfg.batch_size,
-        collate_fn=collate_eeg_windows,
+        collate_fn=collate_audio_windows,
         num_workers=0,
         pin_memory=device == "cuda",
     )
@@ -213,11 +217,11 @@ def main() -> None:
             "Check batch_size, num_workers, and dataset contents."
         ) from exc
 
-    num_tokens = int(first_batch["eeg_values"].shape[1])
+    num_tokens = int(first_batch["signal_values"].shape[1])
     print(
         "first batch:",
         {
-            "eeg_values": describe_tensor_shape(first_batch["eeg_values"]),
+            "signal_values": describe_tensor_shape(first_batch["signal_values"]),
             "frame_indices": describe_tensor_shape(first_batch["frame_indices"]),
             "batch_size": len(first_batch["key"]),
         },
@@ -225,14 +229,15 @@ def main() -> None:
     print(f"train examples: {len(dataset.examples)}")
     print(f"val examples: {len(val_dataset.examples)}")
 
-    frame_encoder = EEGPatchEncoder(
-        num_channels=cfg.eeg_num_channels,
-        patch_size=cfg.eeg_patch_size,
+    frame_encoder = SignalPatchEncoder(
+        num_channels=cfg.audio_num_channels,
+        patch_size=cfg.audio_patch_samples,
         hidden_dim=cfg.frame_hidden_dim,
         depth=cfg.frame_depth,
         heads=cfg.frame_heads,
         mlp_dim=cfg.frame_mlp_dim,
         output_dim=cfg.latent_dim,
+        projector_hidden_dim=cfg.frame_projector_hidden_dim,
         dim_head=cfg.dim_head,
         dropout=cfg.dropout,
     ).to(device)
@@ -315,13 +320,88 @@ def main() -> None:
     codebook.train()
     inverse_dynamics.train()
     predictor.train()
+    optimizer.zero_grad(set_to_none=True)
 
     metrics_history: list[dict[str, float]] = []
     flushed_metrics = 0
 
+    def finalize_optimizer_step() -> None:
+        nonlocal step, flushed_metrics
+        step += 1
+        scaler.step(optimizer)
+        scaler.update()
+        scheduler.step()
+        optimizer.zero_grad(set_to_none=True)
+
+        current_lr = optimizer.param_groups[0]["lr"]
+        metrics_history.append(
+            {
+                "step": float(step),
+                "loss": float(loss.item()),
+                "mse": float(mse_loss.item()),
+                "sigreg": float(sigreg_loss.item()),
+                "codebook": float(codebook_loss.item()),
+                "commitment": float(commitment_loss.item()),
+                "lr": float(current_lr),
+            }
+        )
+
+        if step % cfg.checkpoint_every_steps == 0:
+            save_latest_checkpoint(
+                checkpoint_path,
+                step=step,
+                frame_encoder=frame_encoder,
+                codebook=codebook,
+                inverse_dynamics=inverse_dynamics,
+                predictor=predictor,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+            )
+
+        if step % cfg.metrics_every_steps == 0:
+            val_metrics = evaluate(
+                loader=val_loader,
+                device=device,
+                frame_encoder=frame_encoder,
+                inverse_dynamics=inverse_dynamics,
+                codebook=codebook,
+                predictor=predictor,
+                sigreg=sigreg,
+            )
+            metrics_history[-1].update(
+                {
+                    "val_loss": val_metrics["loss"],
+                    "val_mse": val_metrics["mse"],
+                    "val_sigreg": val_metrics["sigreg"],
+                    "val_codebook": val_metrics["codebook"],
+                    "val_commitment": val_metrics["commitment"],
+                }
+            )
+            flushed_metrics = append_metrics_rows(metrics_path, metrics_history, flushed_metrics)
+            save_metrics_plot(run_dir, metrics_history)
+
+        progress.update(1)
+        progress.set_postfix(
+            epoch=epoch,
+            loss=f"{loss.item():.6f}",
+            val_loss=(
+                f"{metrics_history[-1]['val_loss']:.6f}"
+                if "val_loss" in metrics_history[-1]
+                else "na"
+            ),
+            mse=f"{mse_loss.item():.6f}",
+            sigreg=f"{sigreg_loss.item():.6f}",
+            codebook=f"{codebook_loss.item():.6f}",
+            commitment=f"{commitment_loss.item():.6f}",
+            lr=f"{current_lr:.2e}",
+            signal_shape=str(tuple(signal_values.shape)),
+        )
+
     print("starting training loop")
     progress = tqdm(total=cfg.max_steps, desc="train", dynamic_ncols=True)
     step = 0
+    micro_step = 0
     epoch = 0
     while step < cfg.max_steps:
         epoch += 1
@@ -329,16 +409,15 @@ def main() -> None:
             if step >= cfg.max_steps:
                 break
 
-            step += 1
-            eeg_values = batch["eeg_values"].to(device, non_blocking=True)
-
-            optimizer.zero_grad(set_to_none=True)
+            micro_step += 1
+            signal_values = batch["signal_values"].to(device, non_blocking=True)
+            is_accum_boundary = micro_step % cfg.grad_accum_steps == 0
 
             autocast_context = (
                 torch.autocast(device_type="cuda", dtype=torch.float16) if use_amp else nullcontext()
             )
             with autocast_context:
-                latents = frame_encoder(eeg_values)
+                latents = frame_encoder(signal_values)
                 quantized_actions, codebook_loss, commitment_loss = compute_action_outputs(
                     latents=latents,
                     batch=batch,
@@ -358,75 +437,19 @@ def main() -> None:
                     + (cfg.commitment_loss_weight * commitment_loss)
                 )
 
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
+            scaled_loss = loss / cfg.grad_accum_steps
+            scaler.scale(scaled_loss).backward()
 
-            current_lr = optimizer.param_groups[0]["lr"]
-            metrics_history.append(
-                {
-                    "step": float(step),
-                    "loss": float(loss.item()),
-                    "mse": float(mse_loss.item()),
-                    "sigreg": float(sigreg_loss.item()),
-                    "codebook": float(codebook_loss.item()),
-                    "commitment": float(commitment_loss.item()),
-                    "lr": float(current_lr),
-                }
-            )
+            if not is_accum_boundary:
+                continue
 
-            if step % cfg.checkpoint_every_steps == 0:
-                save_latest_checkpoint(
-                    checkpoint_path,
-                    step=step,
-                    frame_encoder=frame_encoder,
-                    codebook=codebook,
-                    inverse_dynamics=inverse_dynamics,
-                    predictor=predictor,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    scaler=scaler,
-                )
+            finalize_optimizer_step()
 
-            if step % cfg.metrics_every_steps == 0:
-                val_metrics = evaluate(
-                    loader=val_loader,
-                    device=device,
-                    frame_encoder=frame_encoder,
-                    inverse_dynamics=inverse_dynamics,
-                    codebook=codebook,
-                    predictor=predictor,
-                    sigreg=sigreg,
-                )
-                metrics_history[-1].update(
-                    {
-                        "val_loss": val_metrics["loss"],
-                        "val_mse": val_metrics["mse"],
-                        "val_sigreg": val_metrics["sigreg"],
-                        "val_codebook": val_metrics["codebook"],
-                        "val_commitment": val_metrics["commitment"],
-                    }
-                )
-                flushed_metrics = append_metrics_rows(metrics_path, metrics_history, flushed_metrics)
-                save_metrics_plot(run_dir, metrics_history)
+        if micro_step % cfg.grad_accum_steps != 0:
+            finalize_optimizer_step()
 
-            progress.update(1)
-            progress.set_postfix(
-                epoch=epoch,
-                loss=f"{loss.item():.6f}",
-                val_loss=(
-                    f"{metrics_history[-1]['val_loss']:.6f}"
-                    if "val_loss" in metrics_history[-1]
-                    else "na"
-                ),
-                mse=f"{mse_loss.item():.6f}",
-                sigreg=f"{sigreg_loss.item():.6f}",
-                codebook=f"{codebook_loss.item():.6f}",
-                commitment=f"{commitment_loss.item():.6f}",
-                lr=f"{current_lr:.2e}",
-                eeg_shape=str(tuple(eeg_values.shape)),
-            )
+            if step >= cfg.max_steps:
+                break
 
     progress.close()
 

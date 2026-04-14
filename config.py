@@ -2,25 +2,28 @@
 runs_dir = "runs"
 
 # Dataset
-dataset_root = "data/bciciv2a"
-data_files = ["**/BCICIV_2a_[1-9].csv"]
-dataset_fps = 250.0
-train_session_suffixes = ("T",)
-train_subject_ids = ("A01", "A02", "A03", "A04", "A05", "A06", "A07")
-val_subject_ids = ("A08", "A09")
+dataset_backend = "cached"  # "cached" or "raw"
+dataset_root = "data/maestro-v3.0.0"
+dataset_cache_root = "data/maestro_cache"
+dataset_train_splits = ("train",)
+dataset_val_splits = ("validation",)
 action_source = "inferred"  # "inferred", "label", or "none"
-num_action_classes = 4
+num_action_classes = 0
 
-# EEG preprocessing
-eeg_num_channels = 22
-eeg_bandpass_low_hz = 8.0
-eeg_bandpass_high_hz = 30.0
-eeg_epoch_start_seconds = -0.1
-eeg_epoch_end_seconds = 0.7
-eeg_patch_size = 25
+# Audio preprocessing
+audio_sample_rate = 48_000
+audio_mono = True
+audio_num_channels = 1
+audio_clip_seconds = 32.0
+audio_clip_stride_seconds = 32.0
+audio_sequence_length = 4
+audio_sequence_stride = 1
+audio_patch_samples = 19_200
+audio_normalization = "per_clip"
 
 # Optimization
-batch_size = 16
+batch_size = 8
+grad_accum_steps = 6
 num_workers = 2
 persistent_workers = True
 prefetch_factor = 4
@@ -28,13 +31,13 @@ max_steps = 3000
 lr = 3e-4
 warmup_steps = 10
 weight_decay = 1e-4
-sigreg_weight = 0.09
+sigreg_weight = 0.36
 codebook_loss_weight = 1.0
 commitment_loss_weight = 1.0
 
 # Logging and checkpointing
-checkpoint_every_steps = 1000
-metrics_every_steps = 1000
+checkpoint_every_steps = 200
+metrics_every_steps = 200
 
 # Runtime
 amp = True
@@ -48,6 +51,7 @@ frame_hidden_dim = 32
 frame_depth = 1
 frame_heads = 2
 frame_mlp_dim = 64
+frame_projector_hidden_dim = 32
 
 # Predictor
 predictor_hidden_dim = 16
