@@ -1,83 +1,100 @@
 from __future__ import annotations
 
 import argparse
-import tarfile
-import urllib.request
+import shutil
+import subprocess
+import zipfile
 from pathlib import Path
 
-from tqdm.auto import tqdm
 
-
-MARIO_URL = (
-    "https://huggingface.co/datasets/FeiyanZhou/mario_data/resolve/main/"
-    "mariodata.tar.gz"
-)
-MARIO_ARCHIVE = "mariodata.tar.gz"
-MARIO_OUTPUT_DIR = "mariodata"
+KAGGLE_DATASET = "aymanmostafa11/eeg-motor-imagery-bciciv-2a"
+ARCHIVE_NAME = "eeg-motor-imagery-bciciv-2a.zip"
+OUTPUT_DIR_NAME = "bciciv2a"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Download the Mario dataset into the repo-local cache."
+        description="Download the BCI Competition IV 2a EEG dataset from Kaggle."
     )
     parser.add_argument(
         "--output-dir",
-        default=Path(__file__).resolve().parents[1] / "data" / "stablewm",
+        default=Path(__file__).resolve().parents[1] / "data",
         type=Path,
-        help="Directory where the extracted dataset will be written.",
+        help="Directory where the archive and extracted dataset will be written.",
     )
     parser.add_argument(
         "--force",
         action="store_true",
         help="Redownload and overwrite existing files.",
     )
+    parser.add_argument(
+        "--dataset",
+        default=KAGGLE_DATASET,
+        help="Kaggle dataset slug in the form owner/name.",
+    )
     return parser.parse_args()
 
 
-def download(url: str, destination: Path, force: bool) -> None:
+def ensure_kaggle_cli() -> None:
+    if shutil.which("kaggle") is None:
+        raise RuntimeError(
+            "Kaggle CLI not found. Install it with `pip install kaggle` and configure "
+            "`~/.kaggle/kaggle.json` before downloading."
+        )
+
+
+def download_archive(dataset: str, destination: Path, force: bool) -> None:
     if destination.exists() and not force:
         print(f"Archive already exists: {destination}")
         return
 
     destination.parent.mkdir(parents=True, exist_ok=True)
 
-    with urllib.request.urlopen(url) as response:
-        total = int(response.headers.get("Content-Length", "0"))
-        with destination.open("wb") as f, tqdm(
-            total=total if total > 0 else None,
-            unit="B",
-            unit_scale=True,
-            desc=f"download {destination.name}",
-        ) as progress:
-            while True:
-                chunk = response.read(1024 * 1024)
-                if not chunk:
-                    break
-                f.write(chunk)
-                progress.update(len(chunk))
+    command = [
+        "kaggle",
+        "datasets",
+        "download",
+        "-d",
+        dataset,
+        "-p",
+        str(destination.parent),
+    ]
+    if force:
+        command.append("--force")
+
+    print("Running:", " ".join(command))
+    subprocess.run(command, check=True)
+
+    downloaded_archive = destination.parent / f"{dataset.rsplit('/', 1)[-1]}.zip"
+    if downloaded_archive != destination:
+        downloaded_archive.replace(destination)
 
 
-def extract_tar_gz(archive_path: Path, output_dir: Path, force: bool) -> None:
+def extract_archive(archive_path: Path, output_dir: Path, force: bool) -> None:
     if output_dir.exists() and any(output_dir.iterdir()) and not force:
         print(f"Dataset already exists: {output_dir}")
         return
 
+    if force and output_dir.exists():
+        shutil.rmtree(output_dir)
+
     output_dir.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(archive_path, "r:gz") as tar:
-        tar.extractall(path=output_dir.parent)
+    with zipfile.ZipFile(archive_path) as archive:
+        archive.extractall(output_dir)
 
 
 def main() -> int:
     args = parse_args()
-    output_dir = args.output_dir.resolve()
-    archive_path = output_dir / MARIO_ARCHIVE
-    dataset_path = output_dir / MARIO_OUTPUT_DIR
+    ensure_kaggle_cli()
 
-    download(MARIO_URL, archive_path, force=args.force)
-    extract_tar_gz(archive_path, dataset_path, force=args.force)
+    output_root = args.output_dir.resolve()
+    archive_path = output_root / ARCHIVE_NAME
+    dataset_path = output_root / OUTPUT_DIR_NAME
+
+    download_archive(args.dataset, archive_path, force=args.force)
+    extract_archive(archive_path, dataset_path, force=args.force)
 
     print(f"Dataset ready at {dataset_path}")
-
     return 0
 
 

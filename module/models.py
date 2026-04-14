@@ -2,7 +2,6 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 from torch import nn
-from transformers import ViTConfig, ViTModel
 
 
 def modulate(x, shift, scale):
@@ -91,49 +90,6 @@ class Attention(nn.Module):
         return self.to_out(out)
 
 
-class IDAttention(nn.Module):
-    """Attention variant used by the inverse dynamics transformer."""
-
-    def __init__(self, dim, heads=8, dim_head=64, dropout=0.0):
-        super().__init__()
-        inner_dim = dim_head * heads
-        project_out = not (heads == 1 and dim_head == dim)
-        self.heads = heads
-        self.dropout = dropout
-        self.norm = nn.LayerNorm(dim)
-        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)
-        self.to_out = (
-            nn.Sequential(nn.Linear(inner_dim, dim), nn.Dropout(dropout))
-            if project_out
-            else nn.Identity()
-        )
-
-    def forward(self, x):
-        """
-        x: (B, T, D)
-        """
-        _, t, _ = x.shape
-        x = self.norm(x)
-        attn_mask = torch.tril(
-            torch.ones((t, t), device=x.device, dtype=torch.bool),
-            diagonal=1,
-        )
-        dropout_p = self.dropout if self.training else 0.0
-        qkv = self.to_qkv(x).chunk(3, dim=-1)
-        q, k, v = (rearrange(chunk, "b t (h d) -> b h t d", h=self.heads) for chunk in qkv)
-        q, k = apply_rope(q, k)
-        out = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            dropout_p=dropout_p,
-            is_causal=False,
-            attn_mask=attn_mask,
-        )
-        out = rearrange(out, "b h t d -> b t (h d)")
-        return self.to_out(out)
-
-
 class Block(nn.Module):
     """Standard transformer block used by the encoder."""
 
@@ -173,22 +129,6 @@ class ConditionalBlock(nn.Module):
         )
         x = x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
         x = x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
-        return x
-
-
-class IDBlock(nn.Module):
-    """Transformer block used by the inverse dynamics model."""
-
-    def __init__(self, dim, heads, dim_head, mlp_dim, dropout=0.0):
-        super().__init__()
-        self.attn = IDAttention(dim, heads=heads, dim_head=dim_head, dropout=dropout)
-        self.mlp = FeedForward(dim, mlp_dim, dropout=dropout)
-        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-
-    def forward(self, x):
-        x = x + self.attn(self.norm1(x))
-        x = x + self.mlp(self.norm2(x))
         return x
 
 
@@ -245,54 +185,50 @@ class Transformer(nn.Module):
         return self.output_proj(x)
 
 
-class ViTFrameEncoder(nn.Module):
-    """Per-frame Vision Transformer encoder."""
+class EEGPatchEncoder(nn.Module):
+    """Token encoder for EEG patch sequences."""
 
     def __init__(
         self,
         *,
-        image_size: int = 224,
-        patch_size: int = 14,
-        hidden_dim: int = 192,
-        depth: int = 12,
-        heads: int = 3,
-        mlp_dim: int = 768,
+        num_channels: int,
+        patch_size: int,
+        hidden_dim: int,
+        depth: int,
+        heads: int,
+        mlp_dim: int,
         output_dim: int | None = None,
+        dim_head: int = 64,
         dropout: float = 0.0,
     ):
         super().__init__()
-        config = ViTConfig(
-            image_size=image_size,
-            patch_size=patch_size,
-            hidden_size=hidden_dim,
-            num_hidden_layers=depth,
-            num_attention_heads=heads,
-            intermediate_size=mlp_dim,
-            hidden_dropout_prob=dropout,
-            attention_probs_dropout_prob=dropout,
-            qkv_bias=True,
-        )
-        self.backbone = ViTModel(config, add_pooling_layer=False)
-        self.output_proj = (
-            nn.Linear(hidden_dim, output_dim)
-            if output_dim is not None and output_dim != hidden_dim
-            else nn.Identity()
+        input_dim = num_channels * patch_size
+        self.input_proj = nn.Linear(input_dim, hidden_dim)
+        self.transformer = Transformer(
+            input_dim=hidden_dim,
+            hidden_dim=hidden_dim,
+            output_dim=output_dim or hidden_dim,
+            depth=depth,
+            heads=heads,
+            dim_head=dim_head,
+            mlp_dim=mlp_dim,
+            dropout=dropout,
         )
 
-    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+    def forward(self, eeg_values: torch.Tensor) -> torch.Tensor:
         """
-        pixel_values: (B, T, C, H, W)
+        eeg_values: (B, T, C, P)
         returns: (B, T, D)
         """
-        batch_size, num_frames, channels, height, width = pixel_values.shape
-        flat_pixels = pixel_values.reshape(batch_size * num_frames, channels, height, width)
-        outputs = self.backbone(pixel_values=flat_pixels)
-        cls_tokens = outputs.last_hidden_state[:, 0]
-        cls_tokens = self.output_proj(cls_tokens)
-        return cls_tokens.reshape(batch_size, num_frames, -1)
+        batch_size, num_tokens, num_channels, patch_size = eeg_values.shape
+        flat_tokens = eeg_values.reshape(batch_size, num_tokens, num_channels * patch_size)
+        projected = self.input_proj(flat_tokens)
+        return self.transformer(projected)
 
 
 class InverseDynamicsTransformer(nn.Module):
+    """Infer one latent action per transition from past context and the next latent."""
+
     def __init__(
         self,
         *,
@@ -310,19 +246,24 @@ class InverseDynamicsTransformer(nn.Module):
         super().__init__()
         self.num_frames = num_frames
         self.dropout = nn.Dropout(emb_dropout)
-        self.input_proj = (
-            nn.Linear(input_dim, hidden_dim)
-            if input_dim != hidden_dim
-            else nn.Identity()
+        action_dim = output_dim or input_dim
+        self.context_transformer = Transformer(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            output_dim=hidden_dim,
+            depth=depth,
+            heads=heads,
+            dim_head=dim_head,
+            mlp_dim=mlp_dim,
+            dropout=dropout,
         )
-        self.layers = nn.ModuleList(
-            [IDBlock(hidden_dim, heads, dim_head, mlp_dim, dropout) for _ in range(depth)]
-        )
-        self.norm = nn.LayerNorm(hidden_dim)
-        self.output_proj = (
-            nn.Linear(hidden_dim, output_dim or input_dim)
-            if hidden_dim != (output_dim or input_dim)
-            else nn.Identity()
+        self.next_proj = nn.Linear(input_dim, hidden_dim) if input_dim != hidden_dim else nn.Identity()
+        self.action_head = nn.Sequential(
+            nn.LayerNorm(hidden_dim * 2),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, action_dim),
         )
 
     def forward(self, x):
@@ -330,11 +271,15 @@ class InverseDynamicsTransformer(nn.Module):
         x: (B, T, D)
         """
         x = self.dropout(x)
-        x = self.input_proj(x)
-        for block in self.layers:
-            x = block(x)
-        x = self.norm(x)
-        return self.output_proj(x)
+        past_context = self.context_transformer(x)
+        transition_inputs = torch.cat(
+            [
+                past_context[:, :-1],
+                self.next_proj(x[:, 1:]),
+            ],
+            dim=-1,
+        )
+        return self.action_head(transition_inputs)
 
 
 class ARPredictor(nn.Module):

@@ -2,25 +2,29 @@
 runs_dir = "runs"
 
 # Dataset
-dataset_root = "data/stablewm/mariodata"
-data_files = ["**/*.png"]
-dataset_fps = 30.0
-max_windows_per_sequence = None
+dataset_root = "data/bciciv2a"
+data_files = ["**/BCICIV_2a_[1-9].csv"]
+dataset_fps = 250.0
+train_session_suffixes = ("T",)
+train_subject_ids = ("A01", "A02", "A03", "A04", "A05", "A06", "A07")
+val_subject_ids = ("A08", "A09")
+action_source = "inferred"  # "inferred", "label", or "none"
+num_action_classes = 4
 
-# Temporal sampling
-skip_n = 4
-frames_per_window = 32
-window_stride = 128  # frames_per_window * skip_n for non-overlapping windows
-
-# Image preprocessing
-image_size = 224
+# EEG preprocessing
+eeg_num_channels = 22
+eeg_bandpass_low_hz = 8.0
+eeg_bandpass_high_hz = 30.0
+eeg_epoch_start_seconds = -0.1
+eeg_epoch_end_seconds = 0.7
+eeg_patch_size = 25
 
 # Optimization
 batch_size = 16
 num_workers = 2
 persistent_workers = True
 prefetch_factor = 4
-max_steps = 100
+max_steps = 3000
 lr = 3e-4
 warmup_steps = 10
 weight_decay = 1e-4
@@ -29,35 +33,34 @@ codebook_loss_weight = 1.0
 commitment_loss_weight = 1.0
 
 # Logging and checkpointing
-checkpoint_every_steps = 50
-metrics_every_steps = 10
+checkpoint_every_steps = 1000
+metrics_every_steps = 1000
 
 # Runtime
 amp = True
 compile = True
 
-# Frame encoder
-latent_dim = 256
+# Token encoder
+latent_dim = 32
 num_codes = 8
 codebook_beta = 0.25
-frame_patch_size = 14
-frame_hidden_dim = 192
-frame_depth = 12
-frame_heads = 3
-frame_mlp_dim = 768
+frame_hidden_dim = 64
+frame_depth = 2
+frame_heads = 2
+frame_mlp_dim = 128
 
 # Predictor
-predictor_hidden_dim = 256
-predictor_depth = 4
+predictor_hidden_dim = 64
+predictor_depth = 1
 
 # Inverse dynamics
-id_hidden_dim = 256
-id_depth = 4
+id_hidden_dim = 64
+id_depth = 1
 
 # Shared temporal transformer settings
-heads = 8
-dim_head = 64
-mlp_dim = 512
+heads = 2
+dim_head = 16
+mlp_dim = 128
 dropout = 0.0
 
 # Device
