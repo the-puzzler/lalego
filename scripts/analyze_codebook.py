@@ -92,6 +92,7 @@ def main() -> None:
         data_files=cfg.data_files,
         sample_rate=cfg.dataset_fps,
         num_channels=cfg.eeg_num_channels,
+        subject_ids=cfg.train_subject_ids + cfg.val_subject_ids,
         train_session_suffixes=cfg.train_session_suffixes,
         patch_size=cfg.eeg_patch_size,
         bandpass_low_hz=cfg.eeg_bandpass_low_hz,

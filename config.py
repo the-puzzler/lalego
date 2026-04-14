@@ -41,26 +41,26 @@ amp = True
 compile = True
 
 # Token encoder
-latent_dim = 32
+latent_dim = 16
 num_codes = 8
 codebook_beta = 0.25
-frame_hidden_dim = 64
-frame_depth = 2
+frame_hidden_dim = 32
+frame_depth = 1
 frame_heads = 2
-frame_mlp_dim = 128
+frame_mlp_dim = 64
 
 # Predictor
-predictor_hidden_dim = 64
+predictor_hidden_dim = 16
 predictor_depth = 1
 
 # Inverse dynamics
-id_hidden_dim = 64
+id_hidden_dim = 16
 id_depth = 1
 
 # Shared temporal transformer settings
 heads = 2
-dim_head = 16
-mlp_dim = 128
+dim_head = 8
+mlp_dim = 32
 dropout = 0.0
 
 # Device
