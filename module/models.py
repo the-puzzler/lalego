@@ -90,12 +90,75 @@ class Attention(nn.Module):
         return self.to_out(out)
 
 
+class IDAttention(nn.Module):
+    """Self-attention that can see the current token and one step ahead."""
+
+    def __init__(self, dim, heads=8, dim_head=64, dropout=0.0):
+        super().__init__()
+        inner_dim = dim_head * heads
+        project_out = not (heads == 1 and dim_head == dim)
+        self.heads = heads
+        self.dropout = dropout
+        self.norm = nn.LayerNorm(dim)
+        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)
+        self.to_out = (
+            nn.Sequential(nn.Linear(inner_dim, dim), nn.Dropout(dropout))
+            if project_out
+            else nn.Identity()
+        )
+
+    def forward(self, x):
+        """
+        x: (B, T, D)
+        """
+        _, sequence_length, _ = x.shape
+        x = self.norm(x)
+        dropout_p = self.dropout if self.training else 0.0
+        peek_mask = torch.tril(
+            torch.ones(
+                (sequence_length, sequence_length),
+                device=x.device,
+                dtype=torch.bool,
+            ),
+            diagonal=1,
+        )
+        qkv = self.to_qkv(x).chunk(3, dim=-1)
+        q, k, v = (rearrange(t, "b t (h d) -> b h t d", h=self.heads) for t in qkv)
+        q, k = apply_rope(q, k)
+        out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            dropout_p=dropout_p,
+            is_causal=False,
+            attn_mask=peek_mask,
+        )
+        out = rearrange(out, "b h t d -> b t (h d)")
+        return self.to_out(out)
+
+
 class Block(nn.Module):
     """Standard transformer block used by the encoder."""
 
     def __init__(self, dim, heads, dim_head, mlp_dim, dropout=0.0):
         super().__init__()
         self.attn = Attention(dim, heads=heads, dim_head=dim_head, dropout=dropout)
+        self.mlp = FeedForward(dim, mlp_dim, dropout=dropout)
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
+class IDBlock(nn.Module):
+    """Transformer block for inverse dynamics with one-step peek attention."""
+
+    def __init__(self, dim, heads, dim_head, mlp_dim, dropout=0.0):
+        super().__init__()
+        self.attn = IDAttention(dim, heads=heads, dim_head=dim_head, dropout=dropout)
         self.mlp = FeedForward(dim, mlp_dim, dropout=dropout)
         self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
@@ -252,7 +315,7 @@ class SignalPatchEncoder(nn.Module):
 
 
 class InverseDynamicsTransformer(nn.Module):
-    """Infer one latent action per transition from past context and the next latent."""
+    """Infer latent actions with one-step peek attention and direct quantization output."""
 
     def __init__(
         self,
@@ -269,26 +332,18 @@ class InverseDynamicsTransformer(nn.Module):
         emb_dropout=0.0,
     ):
         super().__init__()
-        self.num_frames = num_frames
         self.dropout = nn.Dropout(emb_dropout)
         action_dim = output_dim or input_dim
-        self.context_transformer = Transformer(
+        self.transformer = Transformer(
             input_dim=input_dim,
             hidden_dim=hidden_dim,
-            output_dim=hidden_dim,
+            output_dim=action_dim,
             depth=depth,
             heads=heads,
             dim_head=dim_head,
             mlp_dim=mlp_dim,
             dropout=dropout,
-        )
-        self.next_proj = nn.Linear(input_dim, hidden_dim) if input_dim != hidden_dim else nn.Identity()
-        self.action_head = nn.Sequential(
-            nn.LayerNorm(hidden_dim * 2),
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, action_dim),
+            block_class=IDBlock,
         )
 
     def forward(self, x):
@@ -296,15 +351,7 @@ class InverseDynamicsTransformer(nn.Module):
         x: (B, T, D)
         """
         x = self.dropout(x)
-        past_context = self.context_transformer(x)
-        transition_inputs = torch.cat(
-            [
-                past_context[:, :-1],
-                self.next_proj(x[:, 1:]),
-            ],
-            dim=-1,
-        )
-        return self.action_head(transition_inputs)
+        return self.transformer(x)[:, :-1]
 
 
 class ARPredictor(nn.Module):
@@ -325,7 +372,6 @@ class ARPredictor(nn.Module):
         emb_dropout=0.0,
     ):
         super().__init__()
-        self.num_frames = num_frames
         self.dropout = nn.Dropout(emb_dropout)
         self.transformer = Transformer(
             input_dim=input_dim,

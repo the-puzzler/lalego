@@ -32,7 +32,7 @@ max_steps = 10_000
 lr = 3e-4
 warmup_steps = 10
 weight_decay = 1e-4
-sigreg_weight = 0.18
+sigreg_weight = 0.09
 codebook_loss_weight = 1.0
 commitment_loss_weight = 1.0
 
@@ -45,8 +45,8 @@ amp = True
 compile = True
 
 # Token encoder
-latent_dim = 16
-num_codes = 16
+latent_dim = 128
+num_codes = 8
 codebook_beta = 0.25
 frame_hidden_dim = 128
 frame_depth = 4
@@ -59,7 +59,7 @@ predictor_hidden_dim = 64
 predictor_depth = 3
 
 # Inverse dynamics
-id_hidden_dim = 64
+id_hidden_dim = 128
 id_depth = 3
 
 # Shared temporal transformer settings
