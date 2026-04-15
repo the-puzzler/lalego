@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 import config as cfg
-from module.dataset import AudioTokenDataset, collate_audio_windows
+from module.dataset import build_audio_dataset, collate_audio_windows
 from module.models import ARPredictor, InverseDynamicsTransformer, SignalPatchEncoder, VectorQuantizer
 
 
@@ -61,8 +61,10 @@ def normalize_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, torch
 
 
 def build_loader(split: str, batch_size: int) -> DataLoader:
-    dataset = AudioTokenDataset(
-        data_root=cfg.dataset_root,
+    dataset = build_audio_dataset(
+        dataset_backend=cfg.dataset_backend,
+        dataset_root=cfg.dataset_root,
+        dataset_cache_root=cfg.dataset_cache_root,
         splits=(split,),
         sample_rate=cfg.audio_sample_rate,
         patch_size=cfg.audio_patch_samples,
@@ -72,6 +74,7 @@ def build_loader(split: str, batch_size: int) -> DataLoader:
         sequence_stride=cfg.audio_sequence_stride,
         mono=cfg.audio_mono,
         normalization=cfg.audio_normalization,
+        max_cached_payloads=cfg.dataset_max_cached_payloads,
     )
     return DataLoader(
         dataset,

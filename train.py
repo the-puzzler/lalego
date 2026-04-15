@@ -159,6 +159,7 @@ def main() -> None:
         sequence_stride=cfg.audio_sequence_stride,
         mono=cfg.audio_mono,
         normalization=cfg.audio_normalization,
+        max_cached_payloads=cfg.dataset_max_cached_payloads,
     )
     val_dataset = build_audio_dataset(
         dataset_backend=cfg.dataset_backend,
@@ -173,6 +174,7 @@ def main() -> None:
         sequence_stride=cfg.audio_sequence_stride,
         mono=cfg.audio_mono,
         normalization=cfg.audio_normalization,
+        max_cached_payloads=cfg.dataset_max_cached_payloads,
     )
 
     try:

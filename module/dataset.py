@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import wave
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -373,6 +374,7 @@ class CachedAudioTokenDataset(Dataset[dict[str, Any]]):
         splits: tuple[str, ...] | None = None,
         sequence_length: int = 4,
         sequence_stride: int = 1,
+        max_cached_payloads: int = 2,
         subject_ids: tuple[str, ...] | None = None,
         **_: Any,
     ) -> None:
@@ -381,6 +383,7 @@ class CachedAudioTokenDataset(Dataset[dict[str, Any]]):
         self.splits = _normalize_splits(splits=splits, subject_ids=subject_ids)
         self.sequence_length = int(sequence_length)
         self.sequence_stride = int(sequence_stride)
+        self.max_cached_payloads = max(0, int(max_cached_payloads))
         if self.sequence_length < 2:
             raise ValueError("sequence_length must be at least 2 for dynamics learning")
         if self.sequence_stride <= 0:
@@ -388,7 +391,7 @@ class CachedAudioTokenDataset(Dataset[dict[str, Any]]):
 
         self.performances = self._build_performances()
         self.examples = self._build_examples()
-        self._cache_payloads: dict[Path, dict[str, Any]] = {}
+        self._cache_payloads: OrderedDict[Path, dict[str, Any]] = OrderedDict()
 
     def _build_performances(self) -> list[CachedPerformanceRecord]:
         manifest_path = self.cache_root / "manifest.tsv"
@@ -460,7 +463,13 @@ class CachedAudioTokenDataset(Dataset[dict[str, Any]]):
         payload = self._cache_payloads.get(cache_path)
         if payload is None:
             payload = torch.load(cache_path, map_location="cpu")
-            self._cache_payloads[cache_path] = payload
+            if self.max_cached_payloads > 0:
+                self._cache_payloads[cache_path] = payload
+                self._cache_payloads.move_to_end(cache_path)
+                while len(self._cache_payloads) > self.max_cached_payloads:
+                    self._cache_payloads.popitem(last=False)
+        elif self.max_cached_payloads > 0:
+            self._cache_payloads.move_to_end(cache_path)
         return payload
 
     def __len__(self) -> int:
@@ -531,6 +540,7 @@ def build_audio_dataset(
     sequence_stride: int,
     mono: bool,
     normalization: str,
+    max_cached_payloads: int = 2,
 ) -> Dataset[dict[str, Any]]:
     if dataset_backend == "raw":
         return AudioTokenDataset(
@@ -553,5 +563,6 @@ def build_audio_dataset(
             splits=splits,
             sequence_length=sequence_length,
             sequence_stride=sequence_stride,
+            max_cached_payloads=max_cached_payloads,
         )
     raise ValueError(f"Unsupported dataset_backend={dataset_backend!r}")

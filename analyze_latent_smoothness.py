@@ -71,6 +71,7 @@ def build_loader(split: str, batch_size: int) -> DataLoader:
         sequence_stride=cfg.audio_sequence_stride,
         mono=cfg.audio_mono,
         normalization=cfg.audio_normalization,
+        max_cached_payloads=cfg.dataset_max_cached_payloads,
     )
     return DataLoader(
         dataset,

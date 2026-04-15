@@ -4,7 +4,7 @@ runs_dir = "runs"
 # Dataset
 dataset_backend = "cached"  # "cached" or "raw"
 dataset_root = "data/maestro-v3.0.0"
-dataset_cache_root = "data/maestro_cache"
+dataset_cache_root = "data/maestro_cache_5s"
 dataset_train_splits = ("train",)
 dataset_val_splits = ("validation",)
 action_source = "inferred"  # "inferred", "label", or "none"
@@ -14,30 +14,31 @@ num_action_classes = 0
 audio_sample_rate = 48_000
 audio_mono = True
 audio_num_channels = 1
-audio_clip_seconds = 32.0
-audio_clip_stride_seconds = 32.0
+audio_clip_seconds = 5.0
+audio_clip_stride_seconds = 5.0
 audio_sequence_length = 4
 audio_sequence_stride = 1
-audio_patch_samples = 19_200
+audio_patch_samples = 6_000
 audio_normalization = "per_clip"
 
 # Optimization
-batch_size = 8
+batch_size = 16
 grad_accum_steps = 6
-num_workers = 2
+num_workers = 16
 persistent_workers = True
-prefetch_factor = 4
-max_steps = 3000
+prefetch_factor = 1
+dataset_max_cached_payloads = 1
+max_steps = 10_000
 lr = 3e-4
 warmup_steps = 10
 weight_decay = 1e-4
-sigreg_weight = 0.36
+sigreg_weight = 0.18
 codebook_loss_weight = 1.0
 commitment_loss_weight = 1.0
 
 # Logging and checkpointing
-checkpoint_every_steps = 200
-metrics_every_steps = 200
+checkpoint_every_steps = 500
+metrics_every_steps = 500
 
 # Runtime
 amp = True
@@ -45,26 +46,26 @@ compile = True
 
 # Token encoder
 latent_dim = 16
-num_codes = 8
+num_codes = 16
 codebook_beta = 0.25
-frame_hidden_dim = 32
-frame_depth = 1
-frame_heads = 2
-frame_mlp_dim = 64
-frame_projector_hidden_dim = 32
+frame_hidden_dim = 128
+frame_depth = 4
+frame_heads = 8
+frame_mlp_dim = 256
+frame_projector_hidden_dim = 128
 
 # Predictor
-predictor_hidden_dim = 16
-predictor_depth = 1
+predictor_hidden_dim = 64
+predictor_depth = 3
 
 # Inverse dynamics
-id_hidden_dim = 16
-id_depth = 1
+id_hidden_dim = 64
+id_depth = 3
 
 # Shared temporal transformer settings
-heads = 2
+heads = 8
 dim_head = 8
-mlp_dim = 32
+mlp_dim = 128
 dropout = 0.0
 
 # Device
