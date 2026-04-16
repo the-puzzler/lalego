@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from pathlib import Path
 from contextlib import nullcontext
+from pathlib import Path
 
 import matplotlib
 import torch
@@ -15,16 +15,21 @@ from module.dataset import (
     build_audio_dataset,
     collate_audio_windows,
 )
-from module.models import ARPredictor, InverseDynamicsTransformer, SignalPatchEncoder, VectorQuantizer
+from module.models import (
+    ARPredictor,
+    InverseDynamicsTransformer,
+    VectorQuantizer,
+    build_frame_encoder_from_config,
+)
 from module.sigreg import SIGReg
 from module.utils import (
+    AsyncMetricsPlotter,
     append_metrics_rows,
     count_parameters,
     create_run_dir,
     describe_tensor_shape,
     lr_multiplier,
     save_latest_checkpoint,
-    save_metrics_plot,
 )
 
 matplotlib.use("Agg")
@@ -39,7 +44,7 @@ def compute_action_outputs(
     device: str,
     inverse_dynamics: nn.Module,
     codebook: nn.Module,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+ ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     if cfg.action_source == "inferred":
         action_logits = inverse_dynamics(latents)
         quantizer_outputs = codebook(action_logits)
@@ -47,6 +52,7 @@ def compute_action_outputs(
             quantizer_outputs["quantized"],
             quantizer_outputs["codebook_loss"],
             quantizer_outputs["commitment_loss"],
+            quantizer_outputs["indices"],
         )
 
     if cfg.action_source == "label":
@@ -68,7 +74,24 @@ def compute_action_outputs(
         )
 
     zero = torch.zeros((), device=device, dtype=latents.dtype)
-    return quantized_actions, zero, zero
+    return quantized_actions, zero, zero, None
+
+
+def summarize_latent_geometry(latents: torch.Tensor) -> dict[str, float]:
+    adjacent_a = latents[:, :-1]
+    adjacent_b = latents[:, 1:]
+    random_perm = torch.randperm(latents.shape[0], device=latents.device)
+    random_b = latents[random_perm, 1:]
+    deltas = adjacent_b - adjacent_a
+    return {
+        "adj_mse": float(F.mse_loss(adjacent_a, adjacent_b).item()),
+        "adj_cos": float(F.cosine_similarity(adjacent_a, adjacent_b, dim=-1).mean().item()),
+        "rand_mse": float(F.mse_loss(adjacent_a, random_b).item()),
+        "rand_cos": float(F.cosine_similarity(adjacent_a, random_b, dim=-1).mean().item()),
+        "delta_norm": float(deltas.norm(dim=-1).mean().item()),
+        "latent_std": float(latents.std(dim=(0, 1)).mean().item()),
+        "seq_var": float(latents.var(dim=1).mean().item()),
+    }
 
 
 def evaluate(
@@ -99,7 +122,7 @@ def evaluate(
         for batch in loader:
             signal_values = batch["signal_values"].to(device, non_blocking=True)
             latents = frame_encoder(signal_values)
-            quantized_actions, codebook_loss, commitment_loss = compute_action_outputs(
+            quantized_actions, codebook_loss, commitment_loss, _ = compute_action_outputs(
                 latents=latents,
                 batch=batch,
                 device=device,
@@ -145,6 +168,7 @@ def main() -> None:
     run_dir = create_run_dir(root=ROOT, runs_dir=cfg.runs_dir, config_path=ROOT / "config.py")
     metrics_path = run_dir / "metrics.tsv"
     checkpoint_path = run_dir / "latest.pt"
+    plotter = AsyncMetricsPlotter()
 
     dataset = build_audio_dataset(
         dataset_backend=cfg.dataset_backend,
@@ -203,14 +227,6 @@ def main() -> None:
         pin_memory=device == "cuda",
         prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
     )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=cfg.batch_size,
-        collate_fn=collate_audio_windows,
-        num_workers=0,
-        pin_memory=device == "cuda",
-    )
-
     try:
         first_batch = next(iter(loader))
     except StopIteration as exc:
@@ -231,18 +247,7 @@ def main() -> None:
     print(f"train examples: {len(dataset.examples)}")
     print(f"val examples: {len(val_dataset.examples)}")
 
-    frame_encoder = SignalPatchEncoder(
-        num_channels=cfg.audio_num_channels,
-        patch_size=cfg.audio_patch_samples,
-        hidden_dim=cfg.frame_hidden_dim,
-        depth=cfg.frame_depth,
-        heads=cfg.frame_heads,
-        mlp_dim=cfg.frame_mlp_dim,
-        output_dim=cfg.latent_dim,
-        projector_hidden_dim=cfg.frame_projector_hidden_dim,
-        dim_head=cfg.dim_head,
-        dropout=cfg.dropout,
-    ).to(device)
+    frame_encoder = build_frame_encoder_from_config(cfg).to(device)
     if cfg.action_source == "inferred":
         codebook: nn.Module = VectorQuantizer(
             num_codes=cfg.num_codes,
@@ -345,6 +350,8 @@ def main() -> None:
                 "codebook": float(codebook_loss.item()),
                 "commitment": float(commitment_loss.item()),
                 "lr": float(current_lr),
+                **latent_geometry_stats,
+                **{f"code_count_{index}": float(value) for index, value in enumerate(code_count_values)},
             }
         )
 
@@ -362,26 +369,8 @@ def main() -> None:
             )
 
         if step % cfg.metrics_every_steps == 0:
-            val_metrics = evaluate(
-                loader=val_loader,
-                device=device,
-                frame_encoder=frame_encoder,
-                inverse_dynamics=inverse_dynamics,
-                codebook=codebook,
-                predictor=predictor,
-                sigreg=sigreg,
-            )
-            metrics_history[-1].update(
-                {
-                    "val_loss": val_metrics["loss"],
-                    "val_mse": val_metrics["mse"],
-                    "val_sigreg": val_metrics["sigreg"],
-                    "val_codebook": val_metrics["codebook"],
-                    "val_commitment": val_metrics["commitment"],
-                }
-            )
             flushed_metrics = append_metrics_rows(metrics_path, metrics_history, flushed_metrics)
-            save_metrics_plot(run_dir, metrics_history)
+            plotter.submit(run_dir, metrics_path)
 
         progress.update(1)
         progress.set_postfix(
@@ -420,7 +409,7 @@ def main() -> None:
             )
             with autocast_context:
                 latents = frame_encoder(signal_values)
-                quantized_actions, codebook_loss, commitment_loss = compute_action_outputs(
+                quantized_actions, codebook_loss, commitment_loss, action_indices = compute_action_outputs(
                     latents=latents,
                     batch=batch,
                     device=device,
@@ -438,6 +427,13 @@ def main() -> None:
                     + (cfg.codebook_loss_weight * codebook_loss)
                     + (cfg.commitment_loss_weight * commitment_loss)
                 )
+                latent_geometry_stats = summarize_latent_geometry(latents)
+                if action_indices is not None:
+                    code_count_values = (
+                        torch.bincount(action_indices.reshape(-1).cpu(), minlength=cfg.num_codes).tolist()
+                    )
+                else:
+                    code_count_values = [0] * cfg.num_codes
 
             scaled_loss = loss / cfg.grad_accum_steps
             scaler.scale(scaled_loss).backward()
@@ -467,7 +463,8 @@ def main() -> None:
         scaler=scaler,
     )
     append_metrics_rows(metrics_path, metrics_history, flushed_metrics)
-    save_metrics_plot(run_dir, metrics_history)
+    plotter.submit(run_dir, metrics_path)
+    plotter.close()
 
 
 if __name__ == "__main__":

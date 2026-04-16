@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 from torch import nn
+from transformers import EncodecModel
 
 
 def modulate(x, shift, scale):
@@ -267,13 +268,22 @@ class SignalPatchEncoder(nn.Module):
     ):
         super().__init__()
         self.patch_size = patch_size
-        conv_hidden_dim = max(hidden_dim // 2, 8)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
-        # A small strided conv frontend compresses local waveform structure before the transformer.
+        conv_channels = [
+            max(hidden_dim // 4, 32),
+            max(hidden_dim // 2, 64),
+            hidden_dim,
+            hidden_dim,
+        ]
+        # A deeper strided conv frontend extracts richer local audio features before tokenization.
         self.frontend = nn.Sequential(
-            nn.Conv1d(num_channels, conv_hidden_dim, kernel_size=15, stride=5, padding=7),
+            nn.Conv1d(num_channels, conv_channels[0], kernel_size=15, stride=5, padding=7),
             nn.GELU(),
-            nn.Conv1d(conv_hidden_dim, hidden_dim, kernel_size=15, stride=5, padding=7),
+            nn.Conv1d(conv_channels[0], conv_channels[1], kernel_size=15, stride=4, padding=7),
+            nn.GELU(),
+            nn.Conv1d(conv_channels[1], conv_channels[2], kernel_size=9, stride=2, padding=4),
+            nn.GELU(),
+            nn.Conv1d(conv_channels[2], conv_channels[3], kernel_size=9, stride=1, padding=4),
             nn.GELU(),
         )
         self.transformer = Transformer(
@@ -314,6 +324,133 @@ class SignalPatchEncoder(nn.Module):
         return projected.reshape(batch_size, num_chunks, -1)
 
 
+class EncodecPatchEncoder(nn.Module):
+    """Use continuous EnCodec encoder embeddings as patch tokens for chunk encoding."""
+
+    def __init__(
+        self,
+        *,
+        model_name: str,
+        input_sample_rate: int,
+        hidden_dim: int,
+        depth: int,
+        heads: int,
+        mlp_dim: int,
+        output_dim: int | None = None,
+        projector_hidden_dim: int | None = None,
+        dim_head: int = 64,
+        dropout: float = 0.0,
+        freeze_encodec: bool = True,
+    ):
+        super().__init__()
+        self.input_sample_rate = int(input_sample_rate)
+        self.encodec = EncodecModel.from_pretrained(model_name)
+        self.encodec.eval()
+        self.encodec_sample_rate = int(self.encodec.config.sampling_rate)
+        self.encodec_channels = int(self.encodec.config.audio_channels)
+        if freeze_encodec:
+            for parameter in self.encodec.parameters():
+                parameter.requires_grad_(False)
+
+        encodec_dim = int(self.encodec.config.hidden_size)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+        self.input_proj = (
+            nn.Linear(encodec_dim, hidden_dim) if encodec_dim != hidden_dim else nn.Identity()
+        )
+        self.transformer = Transformer(
+            input_dim=hidden_dim,
+            hidden_dim=hidden_dim,
+            output_dim=output_dim or hidden_dim,
+            depth=depth,
+            heads=heads,
+            dim_head=dim_head,
+            mlp_dim=mlp_dim,
+            dropout=dropout,
+        )
+        projector_output_dim = output_dim or hidden_dim
+        projector_hidden_dim = projector_hidden_dim or hidden_dim
+        self.projector = nn.Sequential(
+            nn.Linear(projector_output_dim, projector_hidden_dim),
+            nn.BatchNorm1d(projector_hidden_dim),
+            nn.GELU(),
+            nn.Linear(projector_hidden_dim, projector_output_dim),
+        )
+
+    def _prepare_waveform(self, flat_chunks: torch.Tensor) -> torch.Tensor:
+        waveform = flat_chunks
+        if waveform.shape[1] != self.encodec_channels:
+            if self.encodec_channels == 1:
+                waveform = waveform.mean(dim=1, keepdim=True)
+            else:
+                waveform = waveform.expand(-1, self.encodec_channels, -1)
+        if self.input_sample_rate != self.encodec_sample_rate:
+            target_num_samples = max(
+                1,
+                int(round(waveform.shape[-1] * self.encodec_sample_rate / self.input_sample_rate)),
+            )
+            waveform = F.interpolate(
+                waveform,
+                size=target_num_samples,
+                mode="linear",
+                align_corners=False,
+            )
+        return waveform
+
+    def forward(self, signal_values: torch.Tensor) -> torch.Tensor:
+        """
+        signal_values: (B, T, C, S)
+        returns: (B, T, D), one latent per chunk
+        """
+        batch_size, num_chunks, num_channels, num_samples = signal_values.shape
+        flat_chunks = signal_values.reshape(batch_size * num_chunks, num_channels, num_samples)
+        waveform = self._prepare_waveform(flat_chunks)
+        encodec_context = torch.no_grad() if not any(
+            parameter.requires_grad for parameter in self.encodec.parameters()
+        ) else torch.enable_grad()
+        with encodec_context:
+            features = self.encodec.encoder(waveform)
+        tokens = features.transpose(1, 2).contiguous()
+        tokens = self.input_proj(tokens)
+        cls_tokens = self.cls_token.expand(tokens.shape[0], -1, -1)
+        tokens = torch.cat([tokens, cls_tokens], dim=1)
+        encoded = self.transformer(tokens)
+        cls_latents = encoded[:, -1]
+        projected = self.projector(cls_latents)
+        return projected.reshape(batch_size, num_chunks, -1)
+
+
+def build_frame_encoder_from_config(cfg) -> nn.Module:
+    encoder_type = getattr(cfg, "frame_encoder_type", "waveform")
+    if encoder_type == "waveform":
+        return SignalPatchEncoder(
+            num_channels=cfg.audio_num_channels,
+            patch_size=cfg.audio_patch_samples,
+            hidden_dim=cfg.frame_hidden_dim,
+            depth=cfg.frame_depth,
+            heads=cfg.frame_heads,
+            mlp_dim=cfg.frame_mlp_dim,
+            output_dim=cfg.latent_dim,
+            projector_hidden_dim=cfg.frame_projector_hidden_dim,
+            dim_head=cfg.dim_head,
+            dropout=cfg.dropout,
+        )
+    if encoder_type == "encodec":
+        return EncodecPatchEncoder(
+            model_name=cfg.encodec_model_name,
+            input_sample_rate=cfg.audio_sample_rate,
+            hidden_dim=cfg.frame_hidden_dim,
+            depth=cfg.frame_depth,
+            heads=cfg.frame_heads,
+            mlp_dim=cfg.frame_mlp_dim,
+            output_dim=cfg.latent_dim,
+            projector_hidden_dim=cfg.frame_projector_hidden_dim,
+            dim_head=cfg.dim_head,
+            dropout=cfg.dropout,
+            freeze_encodec=getattr(cfg, "freeze_encodec", True),
+        )
+    raise ValueError(f"Unsupported frame_encoder_type={encoder_type!r}")
+
+
 class InverseDynamicsTransformer(nn.Module):
     """Infer latent actions with one-step peek attention and direct quantization output."""
 
@@ -345,13 +482,14 @@ class InverseDynamicsTransformer(nn.Module):
             dropout=dropout,
             block_class=IDBlock,
         )
+        self.final_norm = nn.LayerNorm(action_dim)
 
     def forward(self, x):
         """
         x: (B, T, D)
         """
         x = self.dropout(x)
-        return self.transformer(x)[:, :-1]
+        return self.final_norm(self.transformer(x)[:, :-1])
 
 
 class ARPredictor(nn.Module):

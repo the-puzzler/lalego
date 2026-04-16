@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 
 import config as cfg
 from module.dataset import build_audio_dataset, collate_audio_windows
-from module.models import InverseDynamicsTransformer, SignalPatchEncoder, VectorQuantizer
+from module.models import InverseDynamicsTransformer, VectorQuantizer, build_frame_encoder_from_config
 
 
 def parse_args() -> argparse.Namespace:
@@ -118,19 +118,8 @@ def build_models(
     id_hidden_dim: int,
     id_depth: int,
     id_mlp_dim: int,
-) -> tuple[SignalPatchEncoder, InverseDynamicsTransformer, VectorQuantizer]:
-    encoder = SignalPatchEncoder(
-        num_channels=cfg.audio_num_channels,
-        patch_size=cfg.audio_patch_samples,
-        hidden_dim=cfg.frame_hidden_dim,
-        depth=cfg.frame_depth,
-        heads=cfg.frame_heads,
-        mlp_dim=cfg.frame_mlp_dim,
-        output_dim=cfg.latent_dim,
-        projector_hidden_dim=cfg.frame_projector_hidden_dim,
-        dim_head=cfg.dim_head,
-        dropout=cfg.dropout,
-    ).to(device)
+) -> tuple[torch.nn.Module, InverseDynamicsTransformer, VectorQuantizer]:
+    encoder = build_frame_encoder_from_config(cfg).to(device)
     inverse_dynamics = InverseDynamicsTransformer(
         num_frames=cfg.audio_sequence_length,
         input_dim=cfg.latent_dim,

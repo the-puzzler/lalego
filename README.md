@@ -1,0 +1,1 @@
+Note: the vector-quantized action path needs a `LayerNorm` immediately before the codebook (or an equivalent final normalized transformer output). Without that final normalization, action-logit scale shrinks and the codebook loss/usage becomes misleadingly degenerate.

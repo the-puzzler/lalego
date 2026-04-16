@@ -12,7 +12,7 @@ from tqdm import tqdm
 
 import config as cfg
 from module.dataset import build_audio_dataset, collate_audio_windows
-from module.models import SignalPatchEncoder
+from module.models import build_frame_encoder_from_config
 
 
 def parse_args() -> argparse.Namespace:
@@ -61,7 +61,7 @@ def normalize_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, torch
 
 
 class ChunkWaveformDecoder(nn.Module):
-    """Transformer + deconv probe from one chunk latent to one waveform chunk."""
+    """Direct latent-to-waveform decoder probe using only learned upsampling convs."""
 
     def __init__(
         self,
@@ -74,47 +74,30 @@ class ChunkWaveformDecoder(nn.Module):
         decoder_heads: int = 4,
     ) -> None:
         super().__init__()
-        self.patch_size = int(patch_size)
         self.output_samples = int(output_samples)
-        if self.output_samples % self.patch_size != 0:
-            raise ValueError("output_samples must be divisible by patch_size")
-        self.num_patches = self.output_samples // self.patch_size
-        if self.num_patches <= 0:
-            raise ValueError("num_patches must be positive")
-
-        self.cls_proj = nn.Linear(latent_dim, hidden_channels)
-        self.patch_tokens = nn.Parameter(torch.randn(1, self.num_patches, hidden_channels) * 0.02)
-        self.pos_embed = nn.Parameter(torch.randn(1, self.num_patches + 1, hidden_channels) * 0.02)
-        layer = nn.TransformerEncoderLayer(
-            d_model=hidden_channels,
-            nhead=decoder_heads,
-            dim_feedforward=hidden_channels * 4,
-            dropout=0.0,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
+        self.base_steps = max(1, self.output_samples // (10 * 10 * 10 * 6 * 2))
+        if self.output_samples % self.base_steps != 0:
+            raise ValueError("output_samples must be divisible by base_steps")
+        total_upsample = self.output_samples // self.base_steps
+        self.deconv_factors = self._factorize_upsample(total_upsample)
+        self.latent_proj = nn.Sequential(
+            nn.Linear(latent_dim, hidden_channels * self.base_steps),
+            nn.GELU(),
         )
-        self.transformer = nn.TransformerEncoder(layer, num_layers=decoder_depth)
-        self.deconv_factors = self._factorize_patch_size(self.patch_size)
 
-        channels = [
-            hidden_channels,
-            hidden_channels,
-            hidden_channels // 2,
-            hidden_channels // 4,
-            hidden_channels // 8,
-            1,
-        ]
-        needed_layers = len(self.deconv_factors)
-        if needed_layers > len(channels) - 1:
-            raise ValueError(
-                f"Need {needed_layers} deconv stages for patch_size={self.patch_size}, "
-                f"but decoder channel schedule only supports {len(channels) - 1}"
-            )
+        channels = [hidden_channels]
+        current = hidden_channels
+        for _ in range(len(self.deconv_factors) - 1):
+            current = max(current // 2, 32)
+            channels.append(current)
+        channels.append(1)
         layers: list[nn.Module] = []
         in_channels = channels[0]
         for stage_index, factor in enumerate(self.deconv_factors):
-            out_channels = channels[min(stage_index + 1, len(channels) - 1)]
+            is_last_upsample = stage_index == len(self.deconv_factors) - 1
+            out_channels = (
+                1 if is_last_upsample else channels[stage_index + 1]
+            )
             layers.append(
                 nn.ConvTranspose1d(
                     in_channels,
@@ -123,14 +106,14 @@ class ChunkWaveformDecoder(nn.Module):
                     stride=factor,
                 )
             )
-            if stage_index != len(self.deconv_factors) - 1:
+            if not is_last_upsample:
                 layers.append(nn.GELU())
             in_channels = out_channels
         self.deconv = nn.Sequential(*layers)
 
     @staticmethod
-    def _factorize_patch_size(patch_size: int) -> list[int]:
-        remaining = int(patch_size)
+    def _factorize_upsample(total_upsample: int) -> list[int]:
+        remaining = int(total_upsample)
         factors: list[int] = []
         preferred = (10, 8, 6, 5, 4, 3, 2)
         while remaining > 1:
@@ -151,13 +134,8 @@ class ChunkWaveformDecoder(nn.Module):
         latents: (N, D)
         returns: (N, 1, S)
         """
-        cls_token = self.cls_proj(latents).unsqueeze(1)
-        patch_tokens = self.patch_tokens.expand(latents.shape[0], -1, -1)
-        tokens = torch.cat([cls_token, patch_tokens], dim=1)
-        tokens = tokens + self.pos_embed[:, : tokens.shape[1]]
-        decoded = self.transformer(tokens)
-        patch_features = decoded[:, 1:].transpose(1, 2).contiguous()
-        waveform = self.deconv(patch_features)
+        base = self.latent_proj(latents).reshape(latents.shape[0], -1, self.base_steps)
+        waveform = self.deconv(base)
         if waveform.shape[-1] != self.output_samples:
             raise ValueError(
                 f"Decoder produced {waveform.shape[-1]} samples, expected {self.output_samples}"
@@ -199,19 +177,8 @@ def build_loader(
     )
 
 
-def build_encoder(device: str) -> SignalPatchEncoder:
-    return SignalPatchEncoder(
-        num_channels=cfg.audio_num_channels,
-        patch_size=cfg.audio_patch_samples,
-        hidden_dim=cfg.frame_hidden_dim,
-        depth=cfg.frame_depth,
-        heads=cfg.frame_heads,
-        mlp_dim=cfg.frame_mlp_dim,
-        output_dim=cfg.latent_dim,
-        projector_hidden_dim=cfg.frame_projector_hidden_dim,
-        dim_head=cfg.dim_head,
-        dropout=cfg.dropout,
-    ).to(device)
+def build_encoder(device: str):
+    return build_frame_encoder_from_config(cfg).to(device)
 
 
 def find_latest_checkpoint() -> Path:
@@ -233,7 +200,7 @@ def evaluate(
     *,
     loader: DataLoader,
     device: str,
-    encoder: SignalPatchEncoder,
+    encoder: torch.nn.Module,
     decoder: ChunkWaveformDecoder,
     max_batches: int,
     use_amp: bool,
@@ -314,7 +281,7 @@ def main() -> int:
 
     print(f"checkpoint: {checkpoint_path}")
     print(f"probe_output_samples: {output_samples}")
-    print(f"probe_num_patches: {decoder.num_patches}")
+    print(f"probe_base_steps: {decoder.base_steps}")
     print(f"probe_deconv_factors: {decoder.deconv_factors}")
     print(f"decoder_params: {sum(p.numel() for p in decoder.parameters()):,}")
 

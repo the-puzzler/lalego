@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 import csv
 import os
 import sys
@@ -17,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import config as cfg  # noqa: E402
 from module.dataset import normalize_audio_clip, resolve_maestro_root  # noqa: E402
 
 
@@ -44,76 +44,8 @@ class WorkerConfig:
     dtype: str
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Precompute MAESTRO chunk tensors with multi-process CPU workers."
-    )
-    parser.add_argument(
-        "--data-root",
-        type=Path,
-        default=Path("data/maestro-v3.0.0"),
-        help="Path containing the extracted MAESTRO tree.",
-    )
-    parser.add_argument(
-        "--output-root",
-        type=Path,
-        default=Path("data/maestro_cache"),
-        help="Directory where cached chunk shards and manifest will be written.",
-    )
-    parser.add_argument(
-        "--splits",
-        nargs="+",
-        default=("train", "validation", "test"),
-        help="Dataset splits to preprocess.",
-    )
-    parser.add_argument(
-        "--sample-rate",
-        type=int,
-        default=48_000,
-        help="Target sample rate for cached chunks.",
-    )
-    parser.add_argument(
-        "--clip-seconds",
-        type=float,
-        default=32.0,
-        help="Chunk duration in seconds.",
-    )
-    parser.add_argument(
-        "--clip-stride-seconds",
-        type=float,
-        default=32.0,
-        help="Stride between chunk starts in seconds.",
-    )
-    parser.add_argument(
-        "--mono",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Convert audio to mono before caching.",
-    )
-    parser.add_argument(
-        "--normalization",
-        default="per_clip",
-        choices=("per_clip", "none"),
-        help="Normalization mode applied to each cached chunk.",
-    )
-    parser.add_argument(
-        "--dtype",
-        choices=("float16", "float32"),
-        default="float16",
-        help="Storage dtype for cached chunk tensors.",
-    )
-    parser.add_argument(
-        "--workers",
-        type=int,
-        default=max(1, (os.cpu_count() or 1) - 1),
-        help="Number of worker processes to use.",
-    )
-    parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Rewrite existing cached performance shards.",
-    )
-    return parser.parse_args()
+DEFAULT_DTYPE = "float16"
+DEFAULT_OVERWRITE = False
 
 
 def canonical_split_name(split: str) -> str:
@@ -324,10 +256,12 @@ def write_manifest(output_root: Path, rows: list[dict[str, object]]) -> None:
 
 
 def main() -> int:
-    args = parse_args()
-    splits = tuple(canonical_split_name(split) for split in args.splits)
-    root = resolve_maestro_root(args.data_root)
-    output_root = args.output_root.expanduser().resolve()
+    split_names = set(cfg.dataset_train_splits) | set(cfg.dataset_val_splits)
+    if hasattr(cfg, "dataset_test_splits"):
+        split_names |= set(cfg.dataset_test_splits)
+    splits = tuple(canonical_split_name(split) for split in sorted(split_names))
+    root = resolve_maestro_root(Path(cfg.dataset_root))
+    output_root = Path(cfg.dataset_cache_root).expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
     jobs = read_manifest(root, splits)
     if not jobs:
@@ -335,17 +269,19 @@ def main() -> int:
 
     worker_cfg = WorkerConfig(
         output_root=str(output_root),
-        sample_rate=args.sample_rate,
-        clip_seconds=args.clip_seconds,
-        clip_stride_seconds=args.clip_stride_seconds,
-        mono=args.mono,
-        normalization=args.normalization,
-        dtype=args.dtype,
+        sample_rate=cfg.audio_sample_rate,
+        clip_seconds=cfg.audio_clip_seconds,
+        clip_stride_seconds=cfg.audio_clip_stride_seconds,
+        mono=cfg.audio_mono,
+        normalization=cfg.audio_normalization,
+        dtype=DEFAULT_DTYPE,
     )
 
-    tasks = [(job, worker_cfg, args.overwrite) for job in jobs]
+    workers = max(1, (os.cpu_count() or 1) - 1)
+    overwrite = DEFAULT_OVERWRITE
+    tasks = [(job, worker_cfg, overwrite) for job in jobs]
     rows: list[dict[str, object]] = []
-    with ProcessPoolExecutor(max_workers=args.workers, initializer=worker_init) as executor:
+    with ProcessPoolExecutor(max_workers=workers, initializer=worker_init) as executor:
         iterator = executor.map(process_performance, tasks, chunksize=1)
         for row in tqdm(iterator, total=len(tasks), desc="precompute", dynamic_ncols=True):
             rows.append(row)
@@ -361,7 +297,7 @@ def main() -> int:
         chunk_counts[split] = chunk_counts.get(split, 0) + int(row["num_chunks"])
 
     print(f"cached performances: {len(rows)}")
-    print(f"workers: {args.workers}")
+    print(f"workers: {workers}")
     for split in sorted(split_counts):
         print(
             f"{split}: performances={split_counts[split]} chunks={chunk_counts[split]}"
